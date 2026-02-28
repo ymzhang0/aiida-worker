@@ -1,0 +1,6 @@
+I notice that the payload returned by aiida_bridge:serialize_spec contains 'name' key in the nested dict
+whose value is the key of the nested dict. Is this kind of self-reference necessary?
+
+we should add show more information instead of the registred plugins only, including how many profiles are in the environment. how many computers and codes are registered. those that are important for the job submission, we should show them in the webpage.
+
+but not every workchain has get_builder_from_protocol and there might be problems when we inspect this function since it usually doesn't have well-defined structure, the inputs differ from workchain to workchain. so we might start from get_builder function. it has better correspondence to the inputs ports.

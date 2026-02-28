@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import io
 import os
+import threading
+import time
 import traceback
 from collections import defaultdict
-from contextlib import redirect_stderr, redirect_stdout, suppress
+from contextlib import contextmanager, redirect_stderr, redirect_stdout, suppress
+from copy import deepcopy
+from functools import wraps
+from inspect import iscoroutinefunction
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
 from enum import Enum
@@ -15,6 +20,7 @@ from typing import Any, Mapping, Sequence
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from aiida import load_profile, orm
 from aiida.common.exceptions import MissingEntryPointError
@@ -24,7 +30,7 @@ from aiida.engine.processes.ports import InputPort, PortNamespace
 from aiida.manage.configuration import get_config
 from aiida.manage.manager import get_manager
 from aiida.orm import Group, Node, ProcessNode, QueryBuilder
-from aiida.plugins import WorkflowFactory
+from aiida.plugins import DataFactory, WorkflowFactory
 from aiida.plugins.entry_point import get_entry_point_names
 from aiida.storage.sqlite_zip.backend import SqliteZipBackend
 
@@ -32,6 +38,16 @@ PROFILE_NAME = os.getenv("AIIDA_PROFILE", "sandbox")
 _PROFILE_LOADED = False
 _ACTIVE_PROFILE_NAME = ""
 _CURRENT_MOUNTED_ARCHIVE: str | None = None
+_RECENT_NODES_CACHE_TTL_SECONDS = max(0.5, float(os.getenv("AIIDA_RECENT_NODES_CACHE_TTL_SECONDS", "5.0")))
+_RECENT_NODES_CACHE_MAX_ITEMS = max(10, int(os.getenv("AIIDA_RECENT_NODES_CACHE_MAX_ITEMS", "128")))
+_RECENT_NODES_CACHE_LOCK = threading.Lock()
+_RECENT_NODES_CACHE: dict[tuple[int, str | None, str | None], tuple[float, list[dict[str, Any]]]] = {}
+_DB_ACCESS_CONCURRENCY = max(1, int(os.getenv("AIIDA_DB_ACCESS_CONCURRENCY", "4")))
+_DB_ACCESS_ACQUIRE_TIMEOUT_SECONDS = max(0.1, float(os.getenv("AIIDA_DB_ACCESS_ACQUIRE_TIMEOUT_SECONDS", "1.5")))
+_DB_ACCESS_SEMAPHORE = threading.BoundedSemaphore(_DB_ACCESS_CONCURRENCY)
+_DB_POOL_SIZE = 20
+_DB_MAX_OVERFLOW = 30
+_DB_POOL_PRE_PING = True
 
 
 # -----------------------------------------------------------------------------
@@ -44,6 +60,22 @@ def _http_error(status_code: int, error: str, **extra: Any) -> HTTPException:
     if _ACTIVE_PROFILE_NAME and "profile" not in payload:
         payload["profile"] = _ACTIVE_PROFILE_NAME
     return HTTPException(status_code=status_code, detail=payload)
+
+
+@contextmanager
+def _db_access_guard(endpoint: str) -> Any:
+    acquired = _DB_ACCESS_SEMAPHORE.acquire(timeout=_DB_ACCESS_ACQUIRE_TIMEOUT_SECONDS)
+    if not acquired:
+        raise _http_error(
+            503,
+            "Database busy",
+            endpoint=endpoint,
+            reason="Request throttled while waiting for a database slot",
+        )
+    try:
+        yield
+    finally:
+        _DB_ACCESS_SEMAPHORE.release()
 
 
 def _ensure_profile_loaded() -> None:
@@ -66,6 +98,7 @@ def _ensure_profile_loaded() -> None:
             profile = load_profile(candidate)
             _ACTIVE_PROFILE_NAME = str(getattr(profile, "name", candidate or "default"))
             _PROFILE_LOADED = True
+            _configure_storage_engine_pool()
             return
         except Exception as exc:  # noqa: BLE001
             errors.append({"profile": label, "error": str(exc)})
@@ -88,6 +121,7 @@ def _switch_profile(profile_name: str) -> str:
     _ACTIVE_PROFILE_NAME = str(getattr(profile, "name", cleaned))
     _PROFILE_LOADED = True
     _CURRENT_MOUNTED_ARCHIVE = None
+    _configure_storage_engine_pool()
     return _ACTIVE_PROFILE_NAME
 
 
@@ -114,6 +148,7 @@ def _load_archive_profile(filepath: str) -> str:
     _ACTIVE_PROFILE_NAME = str(getattr(profile, "name", archive.stem))
     _PROFILE_LOADED = True
     _CURRENT_MOUNTED_ARCHIVE = str(archive)
+    _configure_storage_engine_pool()
     return _ACTIVE_PROFILE_NAME
 
 
@@ -128,6 +163,174 @@ def _active_profile_name() -> str:
     except Exception:  # noqa: BLE001
         pass
     return PROFILE_NAME.strip() or "unknown"
+
+
+def _configure_storage_engine_pool() -> None:
+    """Configure SQLAlchemy engine pooling for the active storage backend."""
+    try:
+        manager = get_manager()
+        storage = manager.get_profile_storage()
+    except Exception:  # noqa: BLE001
+        return
+
+    backend = getattr(storage, "_backend", storage)
+    session_factory = getattr(backend, "_session_factory", None)
+    bind = getattr(session_factory, "bind", None)
+    if bind is None:
+        return
+
+    pool = getattr(bind, "pool", None)
+    with suppress(Exception):
+        current_size = int(pool.size()) if pool is not None and callable(getattr(pool, "size", None)) else None
+        current_overflow = int(getattr(pool, "_max_overflow", -1))
+        current_pre_ping = bool(getattr(pool, "_pre_ping", False))
+        if (
+            current_size == _DB_POOL_SIZE
+            and current_overflow == _DB_MAX_OVERFLOW
+            and current_pre_ping == _DB_POOL_PRE_PING
+        ):
+            return
+
+    engine = None
+
+    filepath_database = getattr(backend, "filepath_database", None)
+    if filepath_database is not None:
+        with suppress(Exception):
+            from aiida.storage.sqlite_zip.utils import create_sqla_engine
+
+            engine = create_sqla_engine(
+                filepath_database,
+                pool_size=_DB_POOL_SIZE,
+                max_overflow=_DB_MAX_OVERFLOW,
+                pool_pre_ping=_DB_POOL_PRE_PING,
+            )
+
+    if engine is None and str(getattr(getattr(bind, "url", None), "drivername", "")).startswith("sqlite"):
+        database_path = getattr(getattr(bind, "url", None), "database", None)
+        if database_path:
+            with suppress(Exception):
+                from aiida.storage.sqlite_zip.utils import create_sqla_engine
+
+                engine = create_sqla_engine(
+                    database_path,
+                    pool_size=_DB_POOL_SIZE,
+                    max_overflow=_DB_MAX_OVERFLOW,
+                    pool_pre_ping=_DB_POOL_PRE_PING,
+                )
+
+    if engine is None:
+        profile = getattr(backend, "_profile", None)
+        storage_config = deepcopy(getattr(profile, "storage_config", {}) if profile is not None else {})
+        if isinstance(storage_config, Mapping):
+            with suppress(Exception):
+                from aiida.storage.psql_dos.utils import create_sqlalchemy_engine
+
+                engine_kwargs = dict(storage_config.get("engine_kwargs", {}) or {})
+                engine_kwargs.update(
+                    {
+                        "pool_size": _DB_POOL_SIZE,
+                        "max_overflow": _DB_MAX_OVERFLOW,
+                        "pool_pre_ping": _DB_POOL_PRE_PING,
+                    }
+                )
+                storage_config["engine_kwargs"] = engine_kwargs
+                engine = create_sqlalchemy_engine(storage_config)
+
+    if engine is None:
+        return
+
+    remove = getattr(session_factory, "remove", None)
+    if callable(remove):
+        with suppress(Exception):
+            remove()
+
+    with suppress(Exception):
+        session_factory.configure(bind=engine)
+
+    with suppress(Exception):
+        bind.dispose()
+
+
+def _cleanup_storage_session() -> None:
+    """Release thread-local SQLAlchemy sessions for the active profile backend."""
+    try:
+        manager = get_manager()
+        storage = manager.get_profile_storage()
+    except Exception:  # noqa: BLE001
+        return
+
+    backend = getattr(storage, "_backend", storage)
+    session_factory = getattr(backend, "_session_factory", None)
+    session = None
+
+    if session_factory is not None:
+        registry = getattr(session_factory, "registry", None)
+        has = getattr(registry, "has", None)
+        has_session = False
+        if callable(has):
+            with suppress(Exception):
+                has_session = bool(has())
+        if has_session:
+            with suppress(Exception):
+                session = session_factory()
+    else:
+        get_session = getattr(backend, "get_session", None)
+        if callable(get_session):
+            with suppress(Exception):
+                session = get_session()
+
+    if session is not None:
+        with suppress(Exception):
+            session.rollback()
+        with suppress(Exception):
+            session.close()
+
+    remove = getattr(session_factory, "remove", None)
+    if callable(remove):
+        with suppress(Exception):
+            remove()
+
+
+def _wrap_endpoint_with_session_cleanup(endpoint: Any) -> Any:
+    """Wrap FastAPI endpoints so cleanup runs in the same execution context."""
+    if getattr(endpoint, "_session_cleanup_wrapped", False):
+        return endpoint
+
+    if iscoroutinefunction(endpoint):
+
+        @wraps(endpoint)
+        async def _async_wrapped(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return await endpoint(*args, **kwargs)
+            finally:
+                _cleanup_storage_session()
+
+        wrapped_endpoint = _async_wrapped
+    else:
+
+        @wraps(endpoint)
+        def _sync_wrapped(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return endpoint(*args, **kwargs)
+            finally:
+                _cleanup_storage_session()
+
+        wrapped_endpoint = _sync_wrapped
+
+    setattr(wrapped_endpoint, "_session_cleanup_wrapped", True)
+    return wrapped_endpoint
+
+
+class SessionCleanupAPIRouter(APIRouter):
+    """APIRouter that guarantees DB session cleanup after each endpoint."""
+
+    def api_route(self, *args: Any, **kwargs: Any):  # type: ignore[override]
+        route_decorator = super().api_route(*args, **kwargs)
+
+        def _decorator(endpoint: Any) -> Any:
+            return route_decorator(_wrap_endpoint_with_session_cleanup(endpoint))
+
+        return _decorator
 
 
 def _list_profiles_payload() -> dict[str, Any]:
@@ -430,34 +633,62 @@ def _serialize_codes() -> list[dict[str, Any]]:
 def _query_count(cls: type[Any], *, filters: dict[str, Any] | None = None) -> int:
     qb = QueryBuilder()
     qb.append(cls, filters=filters or {})
-    return int(qb.count())
+    with _db_access_guard(f"count:{cls.__name__}"):
+        return int(qb.count())
 
 
 def _collect_system_counts() -> dict[str, int]:
     try:
         groups_count = _query_count(Group)
+    except SQLAlchemyTimeoutError:
+        groups_count = 0
     except Exception:  # noqa: BLE001
         groups_count = 0
 
     try:
         nodes_count = _query_count(Node)
+    except SQLAlchemyTimeoutError:
+        nodes_count = 0
     except Exception:  # noqa: BLE001
         nodes_count = 0
 
     try:
         processes_count = _query_count(ProcessNode)
+    except SQLAlchemyTimeoutError:
+        processes_count = 0
     except Exception:  # noqa: BLE001
         processes_count = 0
 
     try:
         failed_count = _query_count(ProcessNode, filters={"exit_status": {"!==": 0}})
+    except SQLAlchemyTimeoutError:
+        failed_count = 0
     except Exception:  # noqa: BLE001
         failed_count = 0
 
+    try:
+        computers_count = _query_count(orm.Computer)
+    except SQLAlchemyTimeoutError:
+        computers_count = 0
+    except Exception:  # noqa: BLE001
+        computers_count = 0
+
+    try:
+        codes_count = _query_count(orm.Code)
+    except SQLAlchemyTimeoutError:
+        codes_count = 0
+    except Exception:  # noqa: BLE001
+        codes_count = 0
+
+    try:
+        workchains_count = len(get_entry_point_names("aiida.workflows"))
+    except Exception:  # noqa: BLE001
+        workchains_count = 0
+
     return {
-        "computers": len(orm.Computer.collection.all()),
-        "codes": len(orm.Code.collection.all()),
-        "workchains": len(get_entry_point_names("aiida.workflows")),
+        "computers": computers_count,
+        "codes": codes_count,
+        "workchains": workchains_count,
         "groups": groups_count,
         "nodes": nodes_count,
         "processes": processes_count,
@@ -505,6 +736,30 @@ def _node_type_name(node: orm.Node) -> str:
         if len(parts) >= 2:
             return parts[-2]
     return str(node.__class__.__name__)
+
+
+def _extract_process_state_value(node: orm.Node, *, default: str = "unknown") -> str:
+    process_state = getattr(node, "process_state", None)
+    return process_state.value if hasattr(process_state, "value") else str(process_state or default)
+
+
+def _compute_process_execution_time_seconds(node: orm.ProcessNode, state: str | None = None) -> float | None:
+    ctime = getattr(node, "ctime", None)
+    if not isinstance(ctime, datetime):
+        return None
+
+    normalized_state = str(state or _extract_process_state_value(node, default="unknown")).strip().lower()
+    if normalized_state in {"created", "running", "waiting"}:
+        end_time = datetime.now(tz=ctime.tzinfo)
+    else:
+        mtime = getattr(node, "mtime", None)
+        end_time = mtime if isinstance(mtime, datetime) else None
+
+    if not isinstance(end_time, datetime):
+        return None
+
+    elapsed = (end_time - ctime).total_seconds()
+    return round(max(0.0, float(elapsed)), 3)
 
 
 def _extract_node_payload(node: orm.Node) -> Any:
@@ -558,9 +813,13 @@ def _serialize_node(node: orm.Node) -> dict[str, Any]:
     if payload is not None:
         info["payload"] = payload
 
+    preview = _build_node_preview(node)
+    if preview is not None:
+        info["preview_info"] = preview
+        info["preview"] = preview
+
     if isinstance(node, orm.ProcessNode):
-        process_state = getattr(node, "process_state", None)
-        info["state"] = process_state.value if hasattr(process_state, "value") else str(process_state or "unknown")
+        info["state"] = _extract_process_state_value(node)
         info["exit_status"] = getattr(node, "exit_status", None)
         info["process_label"] = str(getattr(node, "process_label", None) or "N/A")
 
@@ -583,8 +842,8 @@ def _get_node_summary(node_pk: int) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         outgoing_count = 0
 
-    process_state = getattr(node, "process_state", None)
-    state_value = process_state.value if hasattr(process_state, "value") else str(process_state or "N/A")
+    state_value = _extract_process_state_value(node, default="N/A")
+    preview = _build_node_preview(node)
 
     return {
         "pk": int(node.pk),
@@ -594,10 +853,13 @@ def _get_node_summary(node_pk: int) -> dict[str, Any]:
         "ctime": node.ctime.strftime("%Y-%m-%d %H:%M:%S") if getattr(node, "ctime", None) else None,
         "label": str(getattr(node, "label", None) or "(No Label)"),
         "state": state_value,
+        "process_label": str(getattr(node, "process_label", None) or "N/A"),
         "exit_status": getattr(node, "exit_status", "N/A"),
         "incoming": incoming_count,
         "outgoing": outgoing_count,
         "attributes": _to_jsonable(node.base.attributes.all),
+        "preview_info": preview,
+        "preview": preview,
     }
 
 
@@ -617,10 +879,109 @@ def _get_structure_formula(node: orm.StructureData) -> str | None:
     return None
 
 
+def _shorten_path_for_preview(path: str | None, *, depth: int = 2) -> str | None:
+    cleaned = str(path or "").strip()
+    if not cleaned:
+        return None
+    segments = [segment for segment in cleaned.rstrip("/").split("/") if segment]
+    if not segments:
+        return cleaned
+    return f".../{'/'.join(segments[-max(1, depth):])}"
+
+
+def _build_node_preview(node: orm.Node) -> dict[str, Any] | None:
+    if isinstance(node, orm.StructureData):
+        atom_count: int | None = None
+        with suppress(Exception):
+            atom_count = len(node.sites)
+        return {
+            "formula": _get_structure_formula(node),
+            "atom_count": atom_count,
+        }
+
+    if isinstance(node, orm.BandsData):
+        num_bands: int | None = None
+        num_kpoints: int | None = None
+
+        with suppress(Exception):
+            bands = node.get_bands()
+            shape = getattr(bands, "shape", None)
+            if shape:
+                if len(shape) >= 2:
+                    num_kpoints = int(shape[-2])
+                    num_bands = int(shape[-1])
+                elif len(shape) == 1:
+                    num_bands = int(shape[0])
+
+        with suppress(Exception):
+            kpoints = node.get_kpoints()
+            num_kpoints = len(kpoints)
+
+        return {
+            "num_bands": num_bands,
+            "num_kpoints": num_kpoints,
+        }
+
+    if isinstance(node, orm.ArrayData):
+        array_names: list[str] = []
+        array_shapes: list[list[int] | None] = []
+        with suppress(Exception):
+            for name in node.get_arraynames():
+                array_names.append(str(name))
+                shape: list[int] | None = None
+                with suppress(Exception):
+                    shape = [int(dimension) for dimension in node.get_shape(name)]
+                if shape is None:
+                    with suppress(Exception):
+                        array = node.get_array(name)
+                        shape = [int(dimension) for dimension in getattr(array, "shape", ())]
+                array_shapes.append(shape)
+        return {
+            "arrays": array_names,
+            "shapes": array_shapes,
+        }
+
+    if isinstance(node, orm.RemoteData):
+        computer_label: str | None = None
+        with suppress(Exception):
+            computer = getattr(node, "computer", None)
+            if computer is not None:
+                computer_label = str(getattr(computer, "label", None) or getattr(computer, "name", None) or "")
+        remote_path: str | None = None
+        with suppress(Exception):
+            remote_path = str(node.get_remote_path())
+        return {
+            "computer": computer_label or None,
+            "path": _shorten_path_for_preview(remote_path),
+        }
+
+    if isinstance(node, orm.FolderData):
+        file_names: list[str] = []
+        with suppress(Exception):
+            file_names = sorted([str(name) for name in node.list_object_names()])
+        return {
+            "file_count": len(file_names),
+            "files": file_names[:3],
+        }
+
+    if isinstance(node, orm.ProcessNode):
+        state = _extract_process_state_value(node)
+        return {
+            "state": state,
+            "execution_time_seconds": _compute_process_execution_time_seconds(node, state=state),
+        }
+
+    return None
+
+
 _NODE_CLASS_MAP: dict[str, type[Node]] = {
     "ProcessNode": ProcessNode,
     "WorkChainNode": orm.WorkChainNode,
     "StructureData": orm.StructureData,
+}
+
+_DATA_ENTRY_POINT_ALIASES: dict[str, str] = {
+    "UpfData": "pseudo.upf",
 }
 
 
@@ -640,6 +1001,30 @@ def _resolve_node_class(node_type: str | None) -> type[Node]:
     if isinstance(dynamic_node_class, type) and issubclass(dynamic_node_class, Node):
         return dynamic_node_class
 
+    normalized_lower = normalized.lower()
+    for attr_name in dir(orm):
+        if attr_name.lower() != normalized_lower:
+            continue
+        candidate = getattr(orm, attr_name, None)
+        if isinstance(candidate, type) and issubclass(candidate, Node):
+            return candidate
+
+    entry_point_candidates: list[str] = []
+    aliased = _DATA_ENTRY_POINT_ALIASES.get(normalized)
+    if aliased:
+        entry_point_candidates.append(aliased)
+
+    if normalized_lower.endswith("data"):
+        base = normalized_lower[:-4]
+        if base:
+            entry_point_candidates.extend([normalized_lower, f"core.{base}"])
+
+    for entry_point in entry_point_candidates:
+        with suppress(MissingEntryPointError, ValueError, TypeError, RuntimeError):
+            factory_cls = DataFactory(entry_point)
+            if isinstance(factory_cls, type) and issubclass(factory_cls, Node):
+                return factory_cls
+
     supported = ", ".join(_NODE_CLASS_MAP.keys())
     raise _http_error(400, f"Unsupported node_type '{normalized}'", supported=supported)
 
@@ -649,8 +1034,11 @@ def _list_group_labels(search_string: str | None = None) -> list[str]:
     filters = {"label": {"like": f"%{search_string}%"}} if search_string else {}
     qb.append(Group, project=["label", "*"], filters=filters)
 
+    with _db_access_guard("groups-labels"):
+        rows = qb.all()
+
     labels: list[str] = []
-    for label, group in qb.all():
+    for label, group in rows:
         if getattr(group, "type_string", "") == "core.import":
             continue
         labels.append(str(label))
@@ -663,8 +1051,11 @@ def _list_groups(search: str | None = None) -> list[dict[str, Any]]:
     filters = {"label": {"like": f"%{search}%"}} if search else {}
     qb.append(Group, project=["label", "id", "*"], filters=filters)
 
+    with _db_access_guard("groups"):
+        rows = qb.all()
+
     items: list[dict[str, Any]] = []
-    for label, pk, group in qb.all():
+    for label, pk, group in rows:
         if getattr(group, "type_string", "") == "core.import":
             continue
         items.append(
@@ -695,6 +1086,7 @@ def _inspect_group(group_name: str, limit: int = 20) -> dict[str, Any]:
     for node in nodes:
         process_state = getattr(node, "process_state", None)
         state_value = process_state.value if hasattr(process_state, "value") else str(process_state or "N/A")
+        preview = _build_node_preview(node)
         serialized_nodes.append(
             {
                 "pk": int(node.pk),
@@ -709,6 +1101,8 @@ def _inspect_group(group_name: str, limit: int = 20) -> dict[str, Any]:
                 "mtime": node.mtime.strftime("%Y-%m-%d %H:%M:%S") if getattr(node, "mtime", None) else None,
                 "attributes": _to_jsonable(node.base.attributes.all),
                 "extras": _to_jsonable(node.base.extras.all),
+                "preview_info": preview,
+                "preview": preview,
             }
         )
 
@@ -725,46 +1119,118 @@ def _inspect_group(group_name: str, limit: int = 20) -> dict[str, Any]:
 
 def _get_recent_processes(limit: int = 15) -> list[dict[str, Any]]:
     qb = QueryBuilder()
-    qb.append(ProcessNode, project=["id", "attributes.process_state", "attributes.process_label", "ctime"], tag="process")
+    qb.append(
+        ProcessNode,
+        project=[
+            "id",
+            "attributes.process_state",
+            "attributes.process_label",
+            "attributes.exit_status",
+            "ctime",
+        ],
+        tag="process",
+    )
     qb.order_by({"process": {"ctime": "desc"}})
     qb.limit(max(1, int(limit)))
 
+    try:
+        with _db_access_guard("recent-processes"):
+            rows = qb.all()
+    except HTTPException:
+        raise
+    except SQLAlchemyTimeoutError as exc:
+        raise _http_error(503, "Database temporarily unavailable", endpoint="recent-processes", reason=str(exc)) from exc
+
     results: list[dict[str, Any]] = []
-    for pk, state, label, ctime in qb.all():
+    for pk, state, label, exit_status, ctime in rows:
         state_value = state.value if hasattr(state, "value") else str(state or "unknown")
         results.append(
             {
                 "pk": int(pk),
                 "label": str(label or "Unknown Task"),
+                "process_label": str(label or "Unknown Task"),
                 "state": state_value,
+                "exit_status": exit_status,
                 "ctime": ctime.strftime("%Y-%m-%d %H:%M:%S") if ctime else None,
             }
         )
     return results
 
 
+def _clone_recent_nodes_payload(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return deepcopy(items)
+
+
+def _get_recent_nodes_cached(
+    key: tuple[int, str | None, str | None],
+    *,
+    allow_stale: bool = False,
+) -> list[dict[str, Any]] | None:
+    with _RECENT_NODES_CACHE_LOCK:
+        record = _RECENT_NODES_CACHE.get(key)
+    if record is None:
+        return None
+    cached_at, payload = record
+    is_fresh = (time.monotonic() - cached_at) <= _RECENT_NODES_CACHE_TTL_SECONDS
+    if not is_fresh and not allow_stale:
+        return None
+    return _clone_recent_nodes_payload(payload)
+
+
+def _set_recent_nodes_cached(key: tuple[int, str | None, str | None], payload: list[dict[str, Any]]) -> None:
+    with _RECENT_NODES_CACHE_LOCK:
+        if len(_RECENT_NODES_CACHE) >= _RECENT_NODES_CACHE_MAX_ITEMS:
+            oldest_key = min(_RECENT_NODES_CACHE.items(), key=lambda item: item[1][0])[0]
+            _RECENT_NODES_CACHE.pop(oldest_key, None)
+        _RECENT_NODES_CACHE[key] = (time.monotonic(), _clone_recent_nodes_payload(payload))
+
+
 def _get_recent_nodes(limit: int = 15, group_label: str | None = None, node_type: str | None = None) -> list[dict[str, Any]]:
-    node_class = _resolve_node_class(node_type)
+    normalized_limit = max(1, int(limit))
+    normalized_group = str(group_label).strip() if group_label and str(group_label).strip() else None
+    normalized_node_type = str(node_type).strip() if node_type and str(node_type).strip() else None
+    cache_key = (normalized_limit, normalized_group, normalized_node_type)
+
+    cached_payload = _get_recent_nodes_cached(cache_key)
+    if cached_payload is not None:
+        return cached_payload
+
+    node_class = _resolve_node_class(normalized_node_type)
     qb = QueryBuilder()
 
-    if group_label and str(group_label).strip():
-        qb.append(Group, filters={"label": str(group_label).strip()}, tag="group")
-        qb.append(node_class, with_group="group", project=["*"], tag="node")
+    if normalized_group:
+        qb.append(Group, filters={"label": normalized_group}, tag="group")
+        qb.append(node_class, with_group="group", project=["*"], tag="node", subclassing=True)
     else:
-        qb.append(node_class, project=["*"], tag="node")
+        qb.append(node_class, project=["*"], tag="node", subclassing=True)
 
     qb.order_by({"node": {"ctime": "desc"}})
-    qb.limit(max(1, int(limit)))
+    qb.limit(normalized_limit)
+
+    try:
+        with _db_access_guard("recent-nodes"):
+            rows = qb.all()
+    except HTTPException as exc:
+        stale_payload = _get_recent_nodes_cached(cache_key, allow_stale=True)
+        if stale_payload is not None:
+            return stale_payload
+        raise exc
+    except SQLAlchemyTimeoutError as exc:
+        stale_payload = _get_recent_nodes_cached(cache_key, allow_stale=True)
+        if stale_payload is not None:
+            return stale_payload
+        raise _http_error(503, "Database temporarily unavailable", endpoint="recent-nodes", reason=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        stale_payload = _get_recent_nodes_cached(cache_key, allow_stale=True)
+        if stale_payload is not None:
+            return stale_payload
+        raise _http_error(500, "Failed to query recent nodes", endpoint="recent-nodes", reason=str(exc)) from exc
 
     results: list[dict[str, Any]] = []
-    for (node,) in qb.all():
+    for (node,) in rows:
         process_state_value: str | None = None
         if isinstance(node, ProcessNode):
-            process_state = getattr(node, "process_state", None)
-            process_state_value = (
-                process_state.value if hasattr(process_state, "value")
-                else (str(process_state) if process_state else "unknown")
-            )
+            process_state_value = _extract_process_state_value(node)
 
         formula_value: str | None = _get_structure_formula(node) if isinstance(node, orm.StructureData) else None
 
@@ -773,6 +1239,7 @@ def _get_recent_nodes(limit: int = 15, group_label: str | None = None, node_type
             label = node.label or formula_value or node.__class__.__name__
         else:
             label = process_label or node.label or node.__class__.__name__
+        preview = _build_node_preview(node)
 
         results.append(
             {
@@ -781,9 +1248,16 @@ def _get_recent_nodes(limit: int = 15, group_label: str | None = None, node_type
                 "label": str(label),
                 "node_type": str(node.__class__.__name__),
                 "process_state": process_state_value,
+                "process_label": str(getattr(node, "process_label", None) or "N/A")
+                if isinstance(node, ProcessNode)
+                else None,
+                "exit_status": getattr(node, "exit_status", None) if isinstance(node, ProcessNode) else None,
                 "formula": formula_value,
+                "preview_info": preview,
+                "preview": preview,
             }
         )
+    _set_recent_nodes_cached(cache_key, results)
     return results
 
 
@@ -853,11 +1327,12 @@ class _ProcessTree:
             subprocesses = sorted(node.called, key=lambda process: process.ctime)
             counts: defaultdict[str, int] = defaultdict(int)
             for sub in subprocesses:
-                raw_label = (
-                    sub.base.attributes.all.get("metadata_inputs", {})
-                    .get("metadata", {})
-                    .get("call_link_label")
-                )
+                raw_label: Any = None
+                metadata_inputs = sub.base.attributes.all.get("metadata_inputs", {})
+                if isinstance(metadata_inputs, Mapping):
+                    metadata = metadata_inputs.get("metadata", {})
+                    if isinstance(metadata, Mapping):
+                        raw_label = metadata.get("call_link_label")
                 if not raw_label:
                     raw_label = getattr(sub, "process_label", "process")
                 label = str(raw_label)
@@ -983,6 +1458,7 @@ def _inspect_process_payload(identifier: str | int) -> dict[str, Any]:
         "pk": int(node.pk),
         "uuid": str(node.uuid),
         "type": _node_type_name(node),
+        "process_label": str(getattr(node, "process_label", None) or "N/A"),
         "state": process_state.value if hasattr(process_state, "value") else str(process_state or "unknown"),
         "exit_status": getattr(node, "exit_status", None),
     }
@@ -1297,10 +1773,10 @@ class BuilderSubmitRequest(BaseModel):
 # Routers
 # -----------------------------------------------------------------------------
 
-management_router = APIRouter(prefix="/management", tags=["management"])
-process_router = APIRouter(prefix="/process", tags=["process"])
-data_router = APIRouter(prefix="/data", tags=["data"])
-submission_router = APIRouter(prefix="/submission", tags=["submission"])
+management_router = SessionCleanupAPIRouter(prefix="/management", tags=["management"])
+process_router = SessionCleanupAPIRouter(prefix="/process", tags=["process"])
+data_router = SessionCleanupAPIRouter(prefix="/data", tags=["data"])
+submission_router = SessionCleanupAPIRouter(prefix="/submission", tags=["submission"])
 
 
 @management_router.get("/profiles")
@@ -1600,6 +2076,15 @@ app = FastAPI(
     description="Bridge API exposing AiiDA management, process/data inspection, and submission workflows.",
     version="2.0.0",
 )
+
+
+@app.middleware("http")
+async def _cleanup_storage_session_middleware(request: Request, call_next: Any):
+    try:
+        response = await call_next(request)
+    finally:
+        _cleanup_storage_session()
+    return response
 
 
 @app.exception_handler(HTTPException)
