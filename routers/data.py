@@ -12,7 +12,7 @@ from fastapi import HTTPException, Query
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from aiida import orm
-from aiida.common.exceptions import MissingEntryPointError
+from aiida.common.exceptions import MissingEntryPointError, NotExistent
 from aiida.engine.daemon.client import get_daemon_client
 from aiida.orm import Group, Node, ProcessNode, QueryBuilder
 from aiida.plugins import DataFactory
@@ -41,6 +41,10 @@ from models.schemas import (
     CodeResource,
     ComputerResource,
     ContextNodesRequest,
+    GroupAddNodesRequest,
+    GroupCreateRequest,
+    GroupRenameRequest,
+    NodeSoftDeleteRequest,
     ProfileSwitchRequest,
     ResourcesResponse,
     SystemInfoResponse,
@@ -54,6 +58,8 @@ _RECENT_NODES_CACHE_TTL_SECONDS = max(0.5, float(os.getenv("AIIDA_RECENT_NODES_C
 _RECENT_NODES_CACHE_MAX_ITEMS = max(10, int(os.getenv("AIIDA_RECENT_NODES_CACHE_MAX_ITEMS", "128")))
 _RECENT_NODES_CACHE_LOCK = threading.Lock()
 _RECENT_NODES_CACHE: dict[tuple[int, str | None, str | None], tuple[float, list[dict[str, Any]]]] = {}
+_SOFT_DELETED_EXTRA_KEY = "sabr_soft_deleted"
+_SOFT_DELETED_AT_EXTRA_KEY = "sabr_soft_deleted_at"
 
 _NODE_CLASS_MAP: dict[str, type[Node]] = {
     "ProcessNode": ProcessNode,
@@ -406,6 +412,161 @@ def _set_recent_nodes_cached(key: tuple[int, str | None, str | None], payload: l
         _RECENT_NODES_CACHE[key] = (time.monotonic(), _clone_recent_nodes_payload(payload))
 
 
+def _clear_recent_nodes_cache() -> None:
+    with _RECENT_NODES_CACHE_LOCK:
+        _RECENT_NODES_CACHE.clear()
+
+
+def _serialize_group_item(group: Group) -> dict[str, Any]:
+    return {
+        "label": str(group.label),
+        "pk": int(group.pk),
+        "count": int(len(group.nodes)),
+        "type_string": str(getattr(group, "type_string", "")) or None,
+    }
+
+
+def _load_group_by_pk(pk: int) -> Group:
+    try:
+        return orm.load_group(pk=int(pk))
+    except (NotExistent, ValueError, TypeError) as exc:
+        raise http_error(404, "Group not found", pk=int(pk)) from exc
+
+
+def _create_group(label: str) -> dict[str, Any]:
+    cleaned = str(label or "").strip()
+    if not cleaned:
+        raise http_error(400, "Group label is required")
+
+    existing = Group.collection.find(filters={"label": cleaned})
+    if existing:
+        raise http_error(409, "Group already exists", label=cleaned)
+
+    group = Group(label=cleaned).store()
+    _clear_recent_nodes_cache()
+    return _serialize_group_item(group)
+
+
+def _rename_group(pk: int, label: str) -> dict[str, Any]:
+    group = _load_group_by_pk(pk)
+    cleaned = str(label or "").strip()
+    if not cleaned:
+        raise http_error(400, "Group label is required")
+
+    if cleaned != str(group.label):
+        existing = Group.collection.find(filters={"label": cleaned})
+        if any(int(candidate.pk) != int(group.pk) for candidate in existing):
+            raise http_error(409, "Group already exists", label=cleaned)
+        group.label = cleaned
+        _clear_recent_nodes_cache()
+
+    return _serialize_group_item(group)
+
+
+def _delete_group(pk: int) -> dict[str, Any]:
+    group = _load_group_by_pk(pk)
+    payload = _serialize_group_item(group)
+    Group.collection.delete(int(group.pk))
+    _clear_recent_nodes_cache()
+    return {"status": "deleted", **payload}
+
+
+def _add_nodes_to_group(pk: int, node_pks: list[int]) -> dict[str, Any]:
+    group = _load_group_by_pk(pk)
+    normalized_ids: list[int] = []
+    seen: set[int] = set()
+    for raw_pk in node_pks:
+        try:
+            parsed = int(raw_pk)
+        except (TypeError, ValueError):
+            continue
+        if parsed <= 0 or parsed in seen:
+            continue
+        seen.add(parsed)
+        normalized_ids.append(parsed)
+
+    if not normalized_ids:
+        return {"group": _serialize_group_item(group), "added": [], "missing": []}
+
+    existing_node_ids = {int(node.pk) for node in group.nodes}
+    nodes_to_add: list[Node] = []
+    added_ids: list[int] = []
+    missing_ids: list[int] = []
+
+    for node_pk in normalized_ids:
+        if node_pk in existing_node_ids:
+            continue
+        try:
+            node = orm.load_node(node_pk)
+        except (NotExistent, ValueError, TypeError):
+            missing_ids.append(node_pk)
+            continue
+        nodes_to_add.append(node)
+        added_ids.append(node_pk)
+
+    if nodes_to_add:
+        group.add_nodes(nodes_to_add)
+        _clear_recent_nodes_cache()
+
+    return {
+        "group": _serialize_group_item(group),
+        "added": added_ids,
+        "missing": missing_ids,
+    }
+
+
+def _is_soft_deleted(node: Node) -> bool:
+    try:
+        return bool(node.base.extras.get(_SOFT_DELETED_EXTRA_KEY, False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _soft_delete_node(pk: int, *, deleted: bool = True) -> dict[str, Any]:
+    try:
+        node = orm.load_node(pk=int(pk))
+    except (NotExistent, ValueError, TypeError) as exc:
+        raise http_error(404, "Node not found", pk=int(pk)) from exc
+
+    if deleted:
+        node.base.extras.set(_SOFT_DELETED_EXTRA_KEY, True)
+        node.base.extras.set(_SOFT_DELETED_AT_EXTRA_KEY, int(time.time()))
+    else:
+        with suppress(Exception):
+            node.base.extras.delete(_SOFT_DELETED_EXTRA_KEY)
+        with suppress(Exception):
+            node.base.extras.delete(_SOFT_DELETED_AT_EXTRA_KEY)
+
+    _clear_recent_nodes_cache()
+    return {"pk": int(node.pk), "soft_deleted": bool(deleted)}
+
+
+def _export_group(pk: int) -> dict[str, Any]:
+    group = _load_group_by_pk(pk)
+    exported_nodes: list[dict[str, Any]] = []
+
+    for node in group.nodes:
+        process_state = getattr(node, "process_state", None)
+        state_value = process_state.value if hasattr(process_state, "value") else str(process_state or "unknown")
+        exported_nodes.append(
+            {
+                "pk": int(node.pk),
+                "uuid": str(node.uuid),
+                "label": str(node.label or node_type_name(node)),
+                "node_type": str(node.__class__.__name__),
+                "process_label": str(getattr(node, "process_label", None) or "N/A"),
+                "process_state": state_value,
+                "ctime": node.ctime.isoformat() if getattr(node, "ctime", None) else None,
+                "mtime": node.mtime.isoformat() if getattr(node, "mtime", None) else None,
+            }
+        )
+
+    return {
+        "group": _serialize_group_item(group),
+        "nodes": exported_nodes,
+    }
+
+
 def _get_recent_nodes(limit: int = 15, group_label: str | None = None, node_type: str | None = None) -> list[dict[str, Any]]:
     normalized_limit = max(1, int(limit))
     normalized_group = str(group_label).strip() if group_label and str(group_label).strip() else None
@@ -426,7 +587,7 @@ def _get_recent_nodes(limit: int = 15, group_label: str | None = None, node_type
         qb.append(node_class, project=["*"], tag="node", subclassing=True)
 
     qb.order_by({"node": {"ctime": "desc"}})
-    qb.limit(normalized_limit)
+    qb.limit(max(normalized_limit * 4, normalized_limit))
 
     try:
         with db_access_guard("recent-nodes"):
@@ -449,6 +610,8 @@ def _get_recent_nodes(limit: int = 15, group_label: str | None = None, node_type
 
     results: list[dict[str, Any]] = []
     for (node,) in rows:
+        if _is_soft_deleted(node):
+            continue
         process_state_value: str | None = None
         if isinstance(node, ProcessNode):
             process_state_value = extract_process_state_value(node)
@@ -478,6 +641,8 @@ def _get_recent_nodes(limit: int = 15, group_label: str | None = None, node_type
                 "preview": preview,
             }
         )
+        if len(results) >= normalized_limit:
+            break
     _set_recent_nodes_cached(cache_key, results)
     return results
 
@@ -689,6 +854,36 @@ def management_groups(search: str | None = Query(default=None)) -> dict[str, Any
     return {"items": _list_groups(search)}
 
 
+@management_router.post("/groups/create")
+def management_create_group(payload: GroupCreateRequest) -> dict[str, Any]:
+    ensure_profile_loaded()
+    return _create_group(payload.label)
+
+
+@management_router.put("/groups/{pk}/label")
+def management_rename_group(pk: int, payload: GroupRenameRequest) -> dict[str, Any]:
+    ensure_profile_loaded()
+    return _rename_group(pk, payload.label)
+
+
+@management_router.delete("/groups/{pk}")
+def management_delete_group(pk: int) -> dict[str, Any]:
+    ensure_profile_loaded()
+    return _delete_group(pk)
+
+
+@management_router.post("/groups/{pk}/nodes")
+def management_add_nodes_to_group(pk: int, payload: GroupAddNodesRequest) -> dict[str, Any]:
+    ensure_profile_loaded()
+    return _add_nodes_to_group(pk, payload.node_pks)
+
+
+@management_router.get("/groups/{pk}/export")
+def management_export_group(pk: int) -> dict[str, Any]:
+    ensure_profile_loaded()
+    return _export_group(pk)
+
+
 @management_router.get("/groups/labels")
 def management_group_labels(search: str | None = Query(default=None)) -> dict[str, Any]:
     ensure_profile_loaded()
@@ -734,6 +929,12 @@ def management_context_nodes(payload: ContextNodesRequest) -> dict[str, Any]:
             error = exc.detail if isinstance(exc.detail, dict) else {"error": str(exc.detail)}
             items.append({"pk": int(raw_pk), **error})
     return {"items": items}
+
+
+@management_router.post("/nodes/{pk}/soft-delete")
+def management_soft_delete_node(pk: int, payload: NodeSoftDeleteRequest) -> dict[str, Any]:
+    ensure_profile_loaded()
+    return _soft_delete_node(pk, deleted=payload.deleted)
 
 
 @management_router.get("/source-map")

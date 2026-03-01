@@ -82,6 +82,22 @@ class ContextNodesRequest(BaseModel):
     ids: list[int] = Field(default_factory=list)
 
 
+class GroupCreateRequest(BaseModel):
+    label: str = Field(..., min_length=1, max_length=255)
+
+
+class GroupRenameRequest(BaseModel):
+    label: str = Field(..., min_length=1, max_length=255)
+
+
+class GroupAddNodesRequest(BaseModel):
+    node_pks: list[int] = Field(default_factory=list)
+
+
+class NodeSoftDeleteRequest(BaseModel):
+    deleted: bool = True
+
+
 class PythonScriptRequest(BaseModel):
     script: str
 
