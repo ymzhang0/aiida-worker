@@ -391,8 +391,10 @@ def _to_jsonable(value: Any) -> Any:
         return str(value)
 
     if isinstance(value, orm.Node):
+        raw_pk = getattr(value, "pk", None)
+        pk_value = int(raw_pk) if isinstance(raw_pk, int) else None
         return {
-            "pk": int(value.pk),
+            "pk": pk_value,
             "uuid": str(value.uuid),
             "type": value.__class__.__name__,
         }
@@ -494,7 +496,14 @@ def _expects_node(port: InputPort | PortNamespace) -> bool:
     return False
 
 
-def _is_node_pk_candidate(port: InputPort | PortNamespace, value: Any) -> bool:
+def _is_node_pk_candidate(
+    port: InputPort | PortNamespace,
+    value: Any,
+    *,
+    allow_scalar_pk_resolution: bool = True,
+) -> bool:
+    if not allow_scalar_pk_resolution:
+        return False
     if not isinstance(value, int):
         return False
     if not _expects_node(port):
@@ -502,7 +511,13 @@ def _is_node_pk_candidate(port: InputPort | PortNamespace, value: Any) -> bool:
     return value > 0
 
 
-def _resolve_node_reference(port: InputPort | PortNamespace, value: Any, path: Sequence[str]) -> Any:
+def _resolve_node_reference(
+    port: InputPort | PortNamespace,
+    value: Any,
+    path: Sequence[str],
+    *,
+    allow_scalar_pk_resolution: bool = True,
+) -> Any:
     if isinstance(value, Mapping):
         if _expects_node(port) and "pk" in value and set(value.keys()).issubset({"pk", "uuid"}):
             raw_pk = value.get("pk")
@@ -514,7 +529,7 @@ def _resolve_node_reference(port: InputPort | PortNamespace, value: Any, path: S
                     raise ValueError(f"Could not load node for '{joined}' with pk={raw_pk}: {exc}") from exc
         return value
 
-    if _is_node_pk_candidate(port, value):
+    if _is_node_pk_candidate(port, value, allow_scalar_pk_resolution=allow_scalar_pk_resolution):
         try:
             loaded_node = orm.load_node(value)
         except Exception as exc:  # noqa: BLE001
@@ -540,6 +555,8 @@ def _resolve_inputs_for_namespace(
     namespace: PortNamespace,
     raw_inputs: Mapping[str, Any],
     path: Sequence[str] = ("inputs",),
+    *,
+    allow_scalar_pk_resolution: bool = True,
 ) -> dict[str, Any]:
     resolved: dict[str, Any] = {}
 
@@ -548,11 +565,21 @@ def _resolve_inputs_for_namespace(
         child_path = (*path, key)
 
         if isinstance(port, PortNamespace) and isinstance(value, Mapping):
-            resolved[key] = _resolve_inputs_for_namespace(port, value, child_path)
+            resolved[key] = _resolve_inputs_for_namespace(
+                port,
+                value,
+                child_path,
+                allow_scalar_pk_resolution=allow_scalar_pk_resolution,
+            )
             continue
 
         if port is not None:
-            resolved[key] = _resolve_node_reference(port, value, child_path)
+            resolved[key] = _resolve_node_reference(
+                port,
+                value,
+                child_path,
+                allow_scalar_pk_resolution=allow_scalar_pk_resolution,
+            )
         else:
             resolved[key] = value
 
@@ -568,8 +595,204 @@ def _prepare_and_validate(process: Any, raw_inputs: Mapping[str, Any]) -> tuple[
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"Failed to pre-process inputs: {exc}") from exc
 
-    validation_error = spec_inputs.validate(processed_inputs)
+    spec = process.spec()
+    validation_error = None
+    used_process_validate = False
+    validate_method = getattr(spec, "validate", None)
+    if callable(validate_method):
+        try:
+            validation_error = validate_method(dict(processed_inputs))
+            used_process_validate = True
+        except Exception:
+            used_process_validate = False
+    if not used_process_validate:
+        validation_error = spec_inputs.validate(processed_inputs)
     return dict(processed_inputs), validation_error
+
+
+def _merge_nested_inputs(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in overlay.items():
+        existing = merged.get(key)
+        if isinstance(existing, Mapping) and isinstance(value, Mapping):
+            merged[str(key)] = _merge_nested_inputs(existing, value)
+        else:
+            merged[str(key)] = value
+    return merged
+
+
+def _safe_pk_value(entity: Any) -> int | None:
+    raw = getattr(entity, "pk", None)
+    if isinstance(raw, int):
+        return int(raw)
+    return None
+
+
+def _serialize_computer_summary(computer: orm.Computer) -> dict[str, Any]:
+    return {
+        "pk": _safe_pk_value(computer),
+        "uuid": str(getattr(computer, "uuid", "") or "") or None,
+        "label": str(getattr(computer, "label", "") or "") or None,
+        "hostname": str(getattr(computer, "hostname", "") or "") or None,
+    }
+
+
+def _serialize_code_summary(code: orm.AbstractCode) -> dict[str, Any]:
+    computer_payload: dict[str, Any] | None = None
+    with suppress(Exception):
+        computer = getattr(code, "computer", None)
+        if isinstance(computer, orm.Computer):
+            computer_payload = _serialize_computer_summary(computer)
+
+    return {
+        "pk": _safe_pk_value(code),
+        "uuid": str(getattr(code, "uuid", "") or "") or None,
+        "label": str(getattr(code, "label", "") or "") or None,
+        "type": code.__class__.__name__,
+        "computer": computer_payload,
+    }
+
+
+def _collect_job_resources(
+    value: Any,
+    *,
+    codes_by_key: dict[str, dict[str, Any]],
+    computers_by_key: dict[str, dict[str, Any]],
+) -> None:
+    if isinstance(value, Mapping):
+        for nested in value.values():
+            _collect_job_resources(nested, codes_by_key=codes_by_key, computers_by_key=computers_by_key)
+        return
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for nested in value:
+            _collect_job_resources(nested, codes_by_key=codes_by_key, computers_by_key=computers_by_key)
+        return
+
+    if isinstance(value, orm.AbstractCode):
+        code_payload = _serialize_code_summary(value)
+        code_key = str(code_payload.get("uuid") or code_payload.get("pk") or id(value))
+        codes_by_key[code_key] = code_payload
+
+        computer_payload = code_payload.get("computer")
+        if isinstance(computer_payload, Mapping):
+            computer_key = str(computer_payload.get("uuid") or computer_payload.get("pk") or f"code:{code_key}")
+            computers_by_key[computer_key] = dict(computer_payload)
+        return
+
+    if isinstance(value, orm.Computer):
+        computer_payload = _serialize_computer_summary(value)
+        computer_key = str(computer_payload.get("uuid") or computer_payload.get("pk") or id(value))
+        computers_by_key[computer_key] = computer_payload
+
+
+def _build_job_validation_summary(inputs: Mapping[str, Any]) -> dict[str, Any]:
+    codes_by_key: dict[str, dict[str, Any]] = {}
+    computers_by_key: dict[str, dict[str, Any]] = {}
+    _collect_job_resources(inputs, codes_by_key=codes_by_key, computers_by_key=computers_by_key)
+
+    codes = list(codes_by_key.values())
+    computers = list(computers_by_key.values())
+    primary_code = codes[0] if codes else None
+    primary_computer = None
+
+    if isinstance(primary_code, Mapping):
+        maybe_primary_computer = primary_code.get("computer")
+        if isinstance(maybe_primary_computer, Mapping):
+            primary_computer = dict(maybe_primary_computer)
+    if primary_computer is None and computers:
+        primary_computer = computers[0]
+
+    return {
+        "inputs": _to_jsonable(inputs),
+        "code": primary_code,
+        "computer": primary_computer,
+        "codes": codes,
+        "computers": computers,
+    }
+
+
+def _validate_job_payload(
+    *,
+    entry_point: str,
+    input_pks: Mapping[str, Any],
+    parameters: Mapping[str, Any],
+) -> dict[str, Any]:
+    process = _load_workflow(entry_point)
+    spec_inputs = process.spec().inputs
+    merged_inputs = _merge_nested_inputs(parameters, input_pks)
+
+    errors: list[dict[str, Any]] = []
+    try:
+        resolved_parameters = _resolve_inputs_for_namespace(
+            spec_inputs,
+            parameters,
+            allow_scalar_pk_resolution=False,
+        )
+        resolved_pk_inputs = _resolve_inputs_for_namespace(
+            spec_inputs,
+            input_pks,
+            allow_scalar_pk_resolution=True,
+        )
+        resolved_inputs = _merge_nested_inputs(resolved_parameters, resolved_pk_inputs)
+    except ValueError as exc:
+        errors.append({"stage": "resolve_inputs", "message": str(exc)})
+        return {
+            "success": False,
+            "dry_run": True,
+            "entry_point": str(entry_point),
+            "summary": {
+                "inputs": _to_jsonable(merged_inputs),
+                "code": None,
+                "computer": None,
+                "codes": [],
+                "computers": [],
+            },
+            "errors": errors,
+        }
+
+    try:
+        processed_inputs = spec_inputs.pre_process(dict(resolved_inputs))
+    except Exception as exc:  # noqa: BLE001
+        errors.append({"stage": "pre_process", "message": str(exc)})
+        return {
+            "success": False,
+            "dry_run": True,
+            "entry_point": str(entry_point),
+            "summary": _build_job_validation_summary(resolved_inputs),
+            "errors": errors,
+        }
+
+    validation_error = None
+    used_process_validate = False
+    spec = process.spec()
+    validate_method = getattr(spec, "validate", None)
+    if callable(validate_method):
+        try:
+            validation_error = validate_method(dict(processed_inputs))
+            used_process_validate = True
+        except Exception:
+            used_process_validate = False
+    if not used_process_validate:
+        validation_error = spec_inputs.validate(processed_inputs)
+
+    if validation_error is not None:
+        errors.append(
+            {
+                "stage": "validate",
+                "port": str(getattr(validation_error, "port", "") or ""),
+                "message": str(getattr(validation_error, "message", "") or str(validation_error)),
+                "full_error": str(validation_error),
+            }
+        )
+
+    return {
+        "success": len(errors) == 0,
+        "dry_run": True,
+        "entry_point": str(entry_point),
+        "summary": _build_job_validation_summary(processed_inputs),
+        "errors": errors,
+    }
 
 
 def _load_workflow(entry_point: str) -> Any:
@@ -1706,6 +1929,20 @@ class ValidationResponse(BaseModel):
     errors: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class JobValidationRequest(BaseModel):
+    entry_point: str = Field(..., description="AiiDA workflow entry point name")
+    input_pks: dict[str, Any] = Field(default_factory=dict, description="Input node PK payload")
+    parameters: dict[str, Any] = Field(default_factory=dict, description="Additional non-node input parameters")
+
+
+class JobValidationResponse(BaseModel):
+    success: bool
+    dry_run: bool = True
+    entry_point: str
+    summary: dict[str, Any]
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class SubmitResponse(BaseModel):
     pk: int
     uuid: str
@@ -1981,6 +2218,18 @@ def submission_validate(payload: WorkflowInputsRequest) -> ValidationResponse:
     return ValidationResponse(success=True, message="Success", errors=[])
 
 
+@submission_router.post("/validate-job", response_model=JobValidationResponse)
+def submission_validate_job(payload: JobValidationRequest) -> JobValidationResponse:
+    _ensure_profile_loaded()
+    return JobValidationResponse(
+        **_validate_job_payload(
+            entry_point=payload.entry_point,
+            input_pks=payload.input_pks,
+            parameters=payload.parameters,
+        )
+    )
+
+
 def _submit_validated_workflow(entry_point: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:
     process = _load_workflow(entry_point)
 
@@ -2142,6 +2391,11 @@ def get_workflow_spec(entry_point: str) -> SpecResponse:
 @app.post("/validate", response_model=ValidationResponse)
 def validate_workflow_inputs(payload: WorkflowInputsRequest) -> ValidationResponse:
     return submission_validate(payload)
+
+
+@app.post("/validate-job", response_model=JobValidationResponse)
+def validate_job(payload: JobValidationRequest) -> JobValidationResponse:
+    return submission_validate_job(payload)
 
 
 @app.post("/submit")
