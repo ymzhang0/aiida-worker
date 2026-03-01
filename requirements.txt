@@ -1,0 +1,6 @@
+aiida-core>=2.7.3
+aiida-quantumespresso>=4.16.0
+fastapi>=0.133.0
+uvicorn>=0.41.0
+pydantic>=2.0.0
+httpx>=0.28.1
