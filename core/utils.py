@@ -34,6 +34,12 @@ def to_jsonable(value: Any) -> Any:
         return str(value)
 
     if isinstance(value, orm.Node):
+        if isinstance(value, orm.Dict):
+            try:
+                return to_jsonable(value.get_dict())
+            except Exception:  # noqa: BLE001
+                pass
+
         raw_pk = getattr(value, "pk", None)
         pk_value = int(raw_pk) if isinstance(raw_pk, int) else None
         return {
