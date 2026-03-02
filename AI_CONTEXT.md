@@ -24,3 +24,8 @@ AiiDA-Worker exposes the state of the local AiiDA profile via deterministic REST
 - **FastAPI / Pydantic:** Core structural API mapping.
 - **AiiDA Core:** Direct data sourcing.
 - **Worker File System:** Persistent storage of "skills" and memory payloads.
+
+## 3. Serialization Insights
+### AiiDA Node Serialization (`to_jsonable`)
+**Location:** `core/utils.py`
+**Implementation:** A utility function used across all API responses to safely cast complex components to standard JSON. Historically, it stripped AiiDA `orm.Node` inputs down to lightweight `{pk, uuid, type}` stubs. To support detailed dictionary inspection in frontends without extra remote calls, structures such as `orm.Dict` explicitly extract `value.get_dict()` during transit.
