@@ -52,7 +52,7 @@ from models.schemas import (
 
 management_router = SessionCleanupAPIRouter(prefix="/management", tags=["management"])
 data_router = SessionCleanupAPIRouter(prefix="/data", tags=["data"])
-plugins_router = SessionCleanupAPIRouter(prefix="/submission", tags=["submission"])
+plugins_router = SessionCleanupAPIRouter(tags=["plugins"])
 
 _RECENT_NODES_CACHE_TTL_SECONDS = max(0.5, float(os.getenv("AIIDA_RECENT_NODES_CACHE_TTL_SECONDS", "5.0")))
 _RECENT_NODES_CACHE_MAX_ITEMS = max(10, int(os.getenv("AIIDA_RECENT_NODES_CACHE_MAX_ITEMS", "128")))
@@ -619,7 +619,13 @@ def _get_recent_nodes(
 
     node_filters: dict[str, Any] = {}
     if normalized_label:
-        node_filters["label"] = {"ilike": f"%{normalized_label}%"}
+        if normalized_label.isdigit():
+            node_filters["or"] = [
+                {"id": int(normalized_label)},
+                {"label": {"ilike": f"%{normalized_label}%"}},
+            ]
+        else:
+            node_filters["label"] = {"ilike": f"%{normalized_label}%"}
     if normalized_process_state:
         node_filters["attributes.process_state"] = normalized_process_state
     

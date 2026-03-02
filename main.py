@@ -92,6 +92,11 @@ def legacy_get_system_info() -> SystemInfoResponse:
     return management_system_info()
 
 
+@app.get("/status", response_model=SystemInfoResponse)
+def legacy_get_status() -> SystemInfoResponse:
+    return management_system_info()
+
+
 @app.get("/resources", response_model=ResourcesResponse)
 def legacy_get_resources() -> ResourcesResponse:
     return management_resources()
