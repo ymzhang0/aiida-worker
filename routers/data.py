@@ -57,7 +57,7 @@ plugins_router = SessionCleanupAPIRouter(prefix="/submission", tags=["submission
 _RECENT_NODES_CACHE_TTL_SECONDS = max(0.5, float(os.getenv("AIIDA_RECENT_NODES_CACHE_TTL_SECONDS", "5.0")))
 _RECENT_NODES_CACHE_MAX_ITEMS = max(10, int(os.getenv("AIIDA_RECENT_NODES_CACHE_MAX_ITEMS", "128")))
 _RECENT_NODES_CACHE_LOCK = threading.Lock()
-_RECENT_NODES_CACHE: dict[tuple[int, str | None, str | None], tuple[float, list[dict[str, Any]]]] = {}
+_RECENT_NODES_CACHE: dict[tuple[int, str | None, str | None, str | None, str | None], tuple[float, list[dict[str, Any]]]] = {}
 _SOFT_DELETED_EXTRA_KEY = "sabr_soft_deleted"
 _SOFT_DELETED_AT_EXTRA_KEY = "sabr_soft_deleted_at"
 
@@ -389,7 +389,7 @@ def _clone_recent_nodes_payload(items: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def _get_recent_nodes_cached(
-    key: tuple[int, str | None, str | None],
+    key: tuple[int, str | None, str | None, str | None, str | None],
     *,
     allow_stale: bool = False,
 ) -> list[dict[str, Any]] | None:
@@ -404,7 +404,7 @@ def _get_recent_nodes_cached(
     return _clone_recent_nodes_payload(payload)
 
 
-def _set_recent_nodes_cached(key: tuple[int, str | None, str | None], payload: list[dict[str, Any]]) -> None:
+def _set_recent_nodes_cached(key: tuple[int, str | None, str | None, str | None, str | None], payload: list[dict[str, Any]]) -> None:
     with _RECENT_NODES_CACHE_LOCK:
         if len(_RECENT_NODES_CACHE) >= _RECENT_NODES_CACHE_MAX_ITEMS:
             oldest_key = min(_RECENT_NODES_CACHE.items(), key=lambda item: item[1][0])[0]
@@ -515,6 +515,22 @@ def _add_nodes_to_group(pk: int, node_pks: list[int]) -> dict[str, Any]:
     }
 
 
+def _remove_node_from_group(pk: int, node_pk: int) -> dict[str, Any]:
+    group = _load_group_by_pk(pk)
+    try:
+        node = orm.load_node(int(node_pk))
+    except (NotExistent, ValueError, TypeError) as exc:
+        raise http_error(404, "Node not found", pk=int(node_pk)) from exc
+
+    existing_node_ids = {int(n.pk) for n in group.nodes}
+    if int(node.pk) not in existing_node_ids:
+        return {"group": _serialize_group_item(group), "removed": False}
+
+    group.remove_nodes([node])
+    _clear_recent_nodes_cache()
+    return {"group": _serialize_group_item(group), "removed": True}
+
+
 def _is_soft_deleted(node: Node) -> bool:
     try:
         return bool(node.base.extras.get(_SOFT_DELETED_EXTRA_KEY, False))
@@ -567,11 +583,26 @@ def _export_group(pk: int) -> dict[str, Any]:
     }
 
 
-def _get_recent_nodes(limit: int = 15, group_label: str | None = None, node_type: str | None = None) -> list[dict[str, Any]]:
+def _get_recent_nodes(
+    limit: int = 15,
+    group_label: str | None = None,
+    node_type: str | None = None,
+    label: str | None = None,
+    process_state: str | None = None,
+) -> list[dict[str, Any]]:
     normalized_limit = max(1, int(limit))
     normalized_group = str(group_label).strip() if group_label and str(group_label).strip() else None
     normalized_node_type = str(node_type).strip() if node_type and str(node_type).strip() else None
-    cache_key = (normalized_limit, normalized_group, normalized_node_type)
+    normalized_label = str(label).strip() if label and str(label).strip() else None
+    normalized_process_state = str(process_state).strip() if process_state and str(process_state).strip() else None
+    
+    cache_key = (
+        normalized_limit,
+        normalized_group,
+        normalized_node_type,
+        normalized_label,
+        normalized_process_state,
+    )
 
     cached_payload = _get_recent_nodes_cached(cache_key)
     if cached_payload is not None:
@@ -585,6 +616,15 @@ def _get_recent_nodes(limit: int = 15, group_label: str | None = None, node_type
         qb.append(node_class, with_group="group", project=["*"], tag="node", subclassing=True)
     else:
         qb.append(node_class, project=["*"], tag="node", subclassing=True)
+
+    node_filters: dict[str, Any] = {}
+    if normalized_label:
+        node_filters["label"] = {"ilike": f"%{normalized_label}%"}
+    if normalized_process_state:
+        node_filters["attributes.process_state"] = normalized_process_state
+    
+    if node_filters:
+        qb.add_filter("node", node_filters)
 
     qb.order_by({"node": {"ctime": "desc"}})
     qb.limit(max(normalized_limit * 4, normalized_limit))
@@ -878,6 +918,12 @@ def management_add_nodes_to_group(pk: int, payload: GroupAddNodesRequest) -> dic
     return _add_nodes_to_group(pk, payload.node_pks)
 
 
+@management_router.delete("/groups/{pk}/nodes/{node_pk}")
+def management_remove_node_from_group(pk: int, node_pk: int) -> dict[str, Any]:
+    ensure_profile_loaded()
+    return _remove_node_from_group(pk, node_pk)
+
+
 @management_router.get("/groups/{pk}/export")
 def management_export_group(pk: int) -> dict[str, Any]:
     ensure_profile_loaded()
@@ -907,9 +953,17 @@ def management_recent_nodes(
     limit: int = Query(default=15, ge=1, le=200),
     group_label: str | None = Query(default=None),
     node_type: str | None = Query(default=None),
+    label: str | None = Query(default=None),
+    process_state: str | None = Query(default=None),
 ) -> dict[str, Any]:
     ensure_profile_loaded()
-    return {"items": _get_recent_nodes(limit=limit, group_label=group_label, node_type=node_type)}
+    return {"items": _get_recent_nodes(
+        limit=limit,
+        group_label=group_label,
+        node_type=node_type,
+        label=label,
+        process_state=process_state,
+    )}
 
 
 @management_router.get("/nodes/{pk}")
