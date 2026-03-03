@@ -40,11 +40,29 @@ class _ProcessTree:
     def to_dict(self) -> dict[str, Any]:
         process_state = getattr(self.node, "process_state", None)
         state_value = process_state.value if hasattr(process_state, "value") else str(process_state or "N/A")
+        
+        inputs: list[dict[str, Any]] = []
+        for link in self.node.base.links.get_incoming().all():
+            serialized = serialize_node(link.node)
+            serialized["link_label"] = str(link.link_label)
+            # Ensure pk is int for JSON consistency
+            serialized["pk"] = int(serialized["pk"])
+            inputs.append(serialized)
+            
+        outputs: list[dict[str, Any]] = []
+        for link in self.node.base.links.get_outgoing().all():
+            serialized = serialize_node(link.node)
+            serialized["link_label"] = str(link.link_label)
+            serialized["pk"] = int(serialized["pk"])
+            outputs.append(serialized)
+
         return {
             "pk": int(self.node.pk),
             "process_label": str(getattr(self.node, "process_label", "N/A") or "N/A"),
             "state": state_value,
             "exit_status": getattr(self.node, "exit_status", None),
+            "inputs": inputs,
+            "outputs": outputs,
             "children": {label: child.to_dict() for label, child in self.children.items()},
         }
 

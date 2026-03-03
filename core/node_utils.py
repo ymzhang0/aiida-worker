@@ -151,6 +151,26 @@ def build_node_preview(node: orm.Node) -> dict[str, Any] | None:
             "execution_time_seconds": compute_process_execution_time_seconds(node, state=state),
         }
 
+    if isinstance(node, orm.Dict):
+        d = node.get_dict()
+        keys = list(d.keys())
+        return {
+            "keys": keys[:5],
+            "count": len(keys),
+            "summary": str(d)[:100] + ("..." if len(str(d)) > 100 else "")
+        }
+
+    if isinstance(node, (orm.List, orm.ArrayData)):
+        try:
+            if isinstance(node, orm.List):
+                l = node.get_list()
+                return {"count": len(l), "summary": str(l)[:100] + ("..." if len(str(l)) > 100 else "")}
+        except Exception:
+            pass
+
+    if isinstance(node, (orm.Int, orm.Float, orm.Str, orm.Bool)):
+        return {"value": str(node.value)}
+
     return None
 
 
@@ -192,14 +212,24 @@ def extract_node_payload(node: orm.Node) -> Any:
 
 
 def serialize_node(node: orm.Node) -> dict[str, Any]:
+    type_name = node_type_name(node)
     info: dict[str, Any] = {
         "pk": int(node.pk),
         "uuid": str(node.uuid),
-        "type": node_type_name(node),
+        "type": type_name,
+        "node_type": type_name,
         "full_type": str(getattr(node, "node_type", node.__class__.__name__)),
-        "label": str(getattr(node, "label", None) or "N/A"),
+        "label": str(getattr(node, "label", None) or ""),
         "ctime": node.ctime.strftime("%Y-%m-%d %H:%M:%S") if getattr(node, "ctime", None) else None,
     }
+
+    if not info["label"]:
+        if isinstance(node, (orm.Int, orm.Float, orm.Str, orm.Bool)):
+            info["label"] = str(node.value)
+        elif isinstance(node, orm.Code):
+            info["label"] = node.label
+        else:
+            info["label"] = type_name
 
     payload = extract_node_payload(node)
     if payload is not None:

@@ -246,6 +246,11 @@ def cleanup_storage_session() -> None:
     try:
         manager = get_manager()
         storage = manager.get_profile_storage()
+        # Check if storage is actually open/available
+        if hasattr(storage, "is_closed") and storage.is_closed():
+            return
+        if hasattr(storage, "_backend") and getattr(storage._backend, "is_closed", lambda: False)():
+            return
     except Exception:  # noqa: BLE001
         return
 
@@ -275,10 +280,11 @@ def cleanup_storage_session() -> None:
         with suppress(Exception):
             session.close()
 
-    remove = getattr(session_factory, "remove", None)
-    if callable(remove):
-        with suppress(Exception):
-            remove()
+    if session_factory is not None:
+        remove = getattr(session_factory, "remove", None)
+        if callable(remove):
+            with suppress(Exception):
+                remove()
 
 
 def _wrap_endpoint_with_session_cleanup(endpoint: Any) -> Any:

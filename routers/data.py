@@ -44,10 +44,14 @@ from models.schemas import (
     GroupAddNodesRequest,
     GroupCreateRequest,
     GroupRenameRequest,
+    InfrastructureSetupRequest,
     NodeSoftDeleteRequest,
+    ProfileSetupRequest,
     ProfileSwitchRequest,
     ResourcesResponse,
+    SSHHostDetails,
     SystemInfoResponse,
+    UserInfoResponse,
 )
 
 management_router = SessionCleanupAPIRouter(prefix="/management", tags=["management"])
@@ -834,6 +838,49 @@ def list_profiles() -> dict[str, Any]:
     return list_profiles_payload()
 
 
+@management_router.get("/profiles/current-user-info", response_model=UserInfoResponse)
+def management_current_user_info() -> dict[str, Any]:
+    ensure_profile_loaded()
+    try:
+        from aiida.manage.configuration import get_profile
+        from aiida import orm
+
+        default_email = get_profile().default_user_email
+        if default_email is None:
+            # We won't crash, instead return empty defaults if there is no user email yet
+            return {"first_name": "", "last_name": "", "email": "", "institution": ""}
+        
+        user = orm.User.collection.get(email=default_email)
+        return {
+            "first_name": str(getattr(user, 'first_name', '')),
+            "last_name": str(getattr(user, 'last_name', '')),
+            "email": str(getattr(user, 'email', '')),
+            "institution": str(getattr(user, 'institution', ''))
+        }
+    except Exception as exc:
+        raise http_error(500, "Failed to extract current user info", reason=str(exc))
+
+
+@management_router.post("/profiles/setup")
+def management_setup_profile(payload: ProfileSetupRequest) -> dict[str, Any]:
+    try:
+        from aiida.manage.configuration import setup_profile
+        
+        setup_profile(
+            profile_name=payload.profile_name,
+            first_name=payload.first_name,
+            last_name=payload.last_name,
+            email=payload.email,
+            institution=payload.institution,
+            filepath=payload.filepath,
+            backend=payload.backend,
+            set_as_default=payload.set_as_default,
+        )
+        return {"status": "success", "profile_name": payload.profile_name}
+    except Exception as exc:
+        raise http_error(500, "Failed to setup profile programmatically", reason=str(exc))
+
+
 @management_router.post("/profiles/switch")
 def management_switch_profile(payload: ProfileSwitchRequest) -> dict[str, Any]:
     ensure_profile_loaded()
@@ -1031,3 +1078,197 @@ def data_remote_file_content(pk: int, filename: str) -> dict[str, Any]:
 def data_repository_file_content(pk: int, filename: str, source: str = Query(default="folder")) -> dict[str, Any]:
     ensure_profile_loaded()
     return _get_node_file_content(pk, filename, source=source)
+
+@management_router.get("/infrastructure")
+def get_infrastructure():
+    """
+    Return a nested structure: List[ComputerSchema].
+    Each ComputerSchema includes metadata and a list of associated Codes.
+    """
+    ensure_profile_loaded()
+    
+    # Get a fresh User in the current session to avoid SQLAlchemy DetachedInstance errors
+    from aiida.manage.configuration import get_profile
+    default_email = get_profile().default_user_email
+    fresh_user = orm.User.collection.get(email=default_email)
+    
+    computers = orm.Computer.collection.all()
+    codes = orm.Code.collection.all()
+    
+    computer_list = []
+    for computer in computers:
+        comp_dict = {
+            "pk": int(computer.pk),
+            "label": str(computer.label),
+            "hostname": str(computer.hostname),
+            "description": str(computer.description) if computer.description else None,
+            "scheduler_type": str(computer.scheduler_type),
+            "transport_type": str(computer.transport_type),
+            "is_enabled": bool(computer.is_user_configured(fresh_user)),
+            "codes": []
+        }
+        # Filter codes for this computer
+        for code in codes:
+            try:
+                if code.computer and int(code.computer.pk) == int(computer.pk):
+                    comp_dict["codes"].append({
+                        "pk": int(code.pk),
+                        "label": str(code.label),
+                        "description": str(code.description) if code.description else None,
+                        "default_calc_job_plugin": str(getattr(code, "default_calc_job_plugin", "") or ""),
+                    })
+            except Exception:
+                continue
+        computer_list.append(comp_dict)
+    
+    return computer_list
+
+@management_router.get("/infrastructure/ssh-config")
+def get_ssh_config() -> list[SSHHostDetails]:
+    """
+    Parse the local ~/.ssh/config file and return a list of available hosts.
+    """
+    import os
+    import paramiko
+
+    ssh_config_path = os.path.expanduser("~/.ssh/config")
+    if not os.path.exists(ssh_config_path):
+        return []
+
+    config = paramiko.config.SSHConfig()
+    try:
+        with open(ssh_config_path, "r") as f:
+            config.parse(f)
+    except Exception as e:
+        # Just return empty if unparseable
+        return []
+
+    hosts = []
+    # config.get_hostnames() returns all defined hosts
+    for alias in config.get_hostnames():
+        # paramiko default includes a catch-all '*', skip it if it's the only rule
+        if alias == '*':
+            continue
+            
+        host_dict = config.lookup(alias)
+        
+        # Determine port
+        port = host_dict.get('port')
+        if port:
+            try:
+                port = int(port)
+            except ValueError:
+                port = None
+
+        # Build SSHHostDetails
+        # Paramiko lookup returns keys in lower case: hostname, user, port, proxyjump, identityfile...
+        details = SSHHostDetails(
+            alias=alias,
+            hostname=host_dict.get('hostname'),
+            username=host_dict.get('user'),
+            port=port,
+            proxy_jump=host_dict.get('proxyjump'),
+            proxy_command=host_dict.get('proxycommand'),
+            identity_file=host_dict.get('identityfile', [None])[0] if isinstance(host_dict.get('identityfile'), list) else host_dict.get('identityfile')
+        )
+        hosts.append(details)
+
+    return hosts
+
+@management_router.post("/infrastructure/setup")
+def setup_infrastructure(payload: InfrastructureSetupRequest):
+    """
+    Create/store an orm.Computer, configure its AuthInfo, test the connection,
+    and optionally configure a Code.
+    """
+    ensure_profile_loaded()
+    try:
+        # 1. Computer Setup
+        try:
+            computer = orm.Computer.collection.get(label=payload.computer_label)
+        except Exception:
+            computer = orm.Computer(
+                label=payload.computer_label,
+                hostname=payload.hostname,
+                description=payload.computer_description or "",
+                transport_type=payload.transport_type,
+                scheduler_type=payload.scheduler_type,
+                work_dir=payload.work_dir
+            )
+        computer.set_mpiprocs_per_machine(payload.mpiprocs_per_machine)
+        if payload.mpirun_command:
+            computer.set_mpirun_command(payload.mpirun_command.split())
+        if payload.prepend_text:
+            computer.set_prepend_text(payload.prepend_text)
+        if payload.append_text:
+            computer.set_append_text(payload.append_text)
+        computer.store()
+        
+        # Configure AuthInfo
+        user = orm.User.collection.get_default()
+        try:
+            authinfo = computer.get_authinfo(user)
+        except Exception:
+            authinfo = orm.AuthInfo(computer=computer, user=user)
+            
+        auth_params = {}
+        if payload.username:
+            auth_params["username"] = payload.username
+        if payload.key_filename:
+            auth_params["key_filename"] = payload.key_filename
+        if payload.proxy_command:
+            auth_params["proxy_command"] = payload.proxy_command
+        if payload.proxy_jump:
+            auth_params["proxy_jump"] = payload.proxy_jump
+        if payload.use_login_shell is not None:
+            auth_params["use_login_shell"] = payload.use_login_shell
+        if payload.safe_interval is not None:
+            auth_params["safe_interval"] = payload.safe_interval
+        if payload.connection_timeout is not None:
+            auth_params["connection_timeout"] = payload.connection_timeout
+            
+        authinfo.set_auth_params(auth_params)
+        authinfo.store()
+        
+        # Test connection
+        connection_status = "success"
+        connection_error = None
+        try:
+            with computer.get_transport() as transport:
+                if not transport.is_open:
+                    transport.open()
+        except Exception as conn_exc:
+            connection_status = "failed"
+            connection_error = str(conn_exc)
+        
+        # Configure Code
+        code_pk = None
+        if payload.code_label and payload.default_calc_job_plugin and payload.remote_abspath:
+            # Check if code exists on this computer
+            existing_codes = orm.Code.collection.find(filters={'label': payload.code_label, 'attributes.remote_computer_uuid': computer.uuid})
+            if existing_codes:
+                code = existing_codes[0]
+            else:
+                code = orm.InstalledCode(
+                    label=payload.code_label,
+                    description=payload.code_description or "",
+                    default_calc_job_plugin=payload.default_calc_job_plugin,
+                    computer=computer,
+                    filepath_executable=payload.remote_abspath
+                )
+            if payload.code_prepend_text:
+                code.set_prepend_text(payload.code_prepend_text)
+            if payload.code_append_text:
+                code.set_append_text(payload.code_append_text)
+            code.store()
+            code_pk = int(code.pk)
+            
+        return {
+            "status": "success", 
+            "computer_pk": int(computer.pk),
+            "code_pk": code_pk,
+            "connection_status": connection_status,
+            "connection_error": connection_error
+        }
+    except Exception as exc:
+        raise http_error(500, "Failed to setup infrastructure", reason=str(exc))

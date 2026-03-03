@@ -168,3 +168,60 @@ class SubmissionScriptRequest(BaseModel):
         if not self.entry_point:
             self.entry_point = self.workchain
         return self
+
+class InfrastructureSetupRequest(BaseModel):
+    # Computer fields
+    computer_label: str = Field(..., min_length=1, max_length=255)
+    hostname: str = Field(..., min_length=1)
+    computer_description: str | None = None
+    transport_type: str = "core.ssh"
+    scheduler_type: str = "core.direct"
+    work_dir: str = "/tmp/aiida"
+    mpiprocs_per_machine: int = 1
+    mpirun_command: str = "mpirun -np {tot_num_mpiprocs}"
+    prepend_text: str | None = None
+    append_text: str | None = None
+    
+    # Auth fields
+    username: str | None = None
+    key_filename: str | None = None
+    proxy_command: str | None = None
+    proxy_jump: str | None = None
+    safe_interval: float | None = None
+    use_login_shell: bool = True
+    connection_timeout: int | None = None
+    
+    # Code fields
+    code_label: str | None = None
+    code_description: str | None = None
+    default_calc_job_plugin: str | None = None
+    remote_abspath: str | None = None
+    code_prepend_text: str | None = None
+    code_append_text: str | None = None
+
+class SSHHostDetails(BaseModel):
+    alias: str
+    hostname: str | None = None
+    username: str | None = None
+    port: int | None = None
+    proxy_jump: str | None = None
+    proxy_command: str | None = None
+    identity_file: str | None = None
+
+
+class UserInfoResponse(BaseModel):
+    first_name: str
+    last_name: str
+    email: str
+    institution: str
+
+
+class ProfileSetupRequest(BaseModel):
+    profile_name: str
+    first_name: str
+    last_name: str
+    email: str
+    institution: str
+    filepath: str
+    backend: str = "core.sqlite_dos"
+    set_as_default: bool = True
