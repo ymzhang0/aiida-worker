@@ -27,6 +27,14 @@ AiiDA-Worker exposes the state of the local AiiDA profile via deterministic REST
 - **FastAPI / Pydantic:** Core structural API mapping.
 - **AiiDA Core:** Direct data sourcing.
 - **Worker File System:** Persistent storage of "skills" and memory payloads.
+- **Analysis Library:** Standardized scientific analytical modules.
+
+## 4. AiiDA Analysis Library (Modular Logic)
+**Location:** `repository/analysis/`
+**Implementation:** A structured library designed to replace fragmented Jupyter Notebooks. It decouples core scientific logic from AiiDA's infrastructure and plotting.
+- **Common Utilities (`common_utils.py`):** Centralized physical formulas (e.g., elasticity averages, ratio calculations) shared across all analysis modules.
+- **Domain Modules (e.g., `born_charges/`):** Encapsulated logic for specific scientific purposes. Modules like `BornAnalyzer` extract data from AiiDA WorkChain outputs, compute derivative properties, and check stability.
+- **Standardized Entry Points (`entries/`):** Uniform Python scripts (e.g., `run_born.py`) implementing a `run(node_pk, **kwargs)` function. These serve as the primary interface for SABR and other external services, returning JSON-serializable results.
 
 ## 3. Serialization Insights
 ### AiiDA Node Serialization (`to_jsonable`)

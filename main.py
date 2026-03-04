@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -11,6 +14,7 @@ from core.engine import (
     ensure_profile_loaded,
     ensure_script_registry_dir,
 )
+from core.events import aiida_event_listener
 from routers.data import (
     data_router,
     management_router,
@@ -21,10 +25,43 @@ from routers.process import process_router
 from routers.registry import registry_router
 from routers.submission import submission_router
 
+logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────
+# Lifespan
+# ──────────────────────────────────────────────────────
+
+_listener_task: asyncio.Task[None] | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _listener_task
+
+    # Startup
+    ensure_profile_loaded()
+    ensure_script_registry_dir()
+
+    _listener_task = asyncio.create_task(aiida_event_listener())
+    logger.info("AiiDA event listener started as background task")
+
+    yield
+
+    # Shutdown
+    if _listener_task is not None and not _listener_task.done():
+        _listener_task.cancel()
+        try:
+            await _listener_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("AiiDA event listener stopped")
+
+
 app = FastAPI(
     title="AiiDA Bridge API",
     description="Bridge API exposing AiiDA management, process/data inspection, and submission workflows.",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -51,12 +88,6 @@ async def _unhandled_exception_handler(_: Request, exc: Exception) -> JSONRespon
     if profile_name:
         payload["profile"] = profile_name
     return JSONResponse(status_code=500, content=payload)
-
-
-@app.on_event("startup")
-def _startup() -> None:
-    ensure_profile_loaded()
-    ensure_script_registry_dir()
 
 
 app.include_router(management_router)
@@ -114,7 +145,6 @@ def root_resources():
         "computers": serialize_computers(),
         "codes": serialize_codes(),
     }
-
 
 
 
