@@ -12,10 +12,14 @@ from typing import Any, Mapping
 
 from fastapi import APIRouter, HTTPException
 
-from aiida import load_profile
+from aiida import load_profile, orm
 from aiida.manage.configuration import get_config
 from aiida.manage.manager import get_manager
 from aiida.storage.sqlite_zip.backend import SqliteZipBackend
+from aiida.engine.daemon.client import get_daemon_client
+from aiida.orm import Group, Node, ProcessNode, QueryBuilder
+from aiida.plugins.entry_point import get_entry_point_names
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 PROFILE_NAME = os.getenv("AIIDA_PROFILE", "sandbox")
 _PROFILE_LOADED = False
@@ -388,3 +392,123 @@ def script_path(script_name: str) -> Path:
 def script_meta_path(script_name: str) -> Path:
     safe_name = normalize_script_name(script_name)
     return ensure_script_registry_dir() / f"{safe_name}.json"
+
+
+def _is_daemon_running() -> bool:
+    try:
+        daemon_client = get_daemon_client()
+        return bool(getattr(daemon_client, "is_daemon_running", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _query_count(cls: type[Any], *, filters: dict[str, Any] | None = None) -> int:
+    qb = QueryBuilder()
+    qb.append(cls, filters=filters or {})
+    with db_access_guard(f"count:{cls.__name__}"):
+        return int(qb.count())
+
+
+def _collect_system_counts() -> dict[str, int]:
+    try:
+        groups_count = _query_count(Group)
+    except SQLAlchemyTimeoutError:
+        groups_count = 0
+    except Exception:  # noqa: BLE001
+        groups_count = 0
+
+    try:
+        nodes_count = _query_count(Node)
+    except SQLAlchemyTimeoutError:
+        nodes_count = 0
+    except Exception:  # noqa: BLE001
+        nodes_count = 0
+
+    try:
+        processes_count = _query_count(ProcessNode)
+    except SQLAlchemyTimeoutError:
+        processes_count = 0
+    except Exception:  # noqa: BLE001
+        processes_count = 0
+
+    try:
+        failed_count = _query_count(ProcessNode, filters={"exit_status": {"!==": 0}})
+    except SQLAlchemyTimeoutError:
+        failed_count = 0
+    except Exception:  # noqa: BLE001
+        failed_count = 0
+
+    try:
+        computers_count = _query_count(orm.Computer)
+    except SQLAlchemyTimeoutError:
+        computers_count = 0
+    except Exception:  # noqa: BLE001
+        computers_count = 0
+
+    try:
+        codes_count = _query_count(orm.Code)
+    except SQLAlchemyTimeoutError:
+        codes_count = 0
+    except Exception:  # noqa: BLE001
+        codes_count = 0
+
+    try:
+        workchains_count = len(get_entry_point_names("aiida.workflows"))
+    except Exception:  # noqa: BLE001
+        workchains_count = 0
+
+    return {
+        "computers": computers_count,
+        "codes": codes_count,
+        "workchains": workchains_count,
+        "groups": groups_count,
+        "nodes": nodes_count,
+        "processes": processes_count,
+        "failed_processes": failed_count,
+    }
+
+
+def get_system_info_payload() -> dict[str, Any]:
+    counts = _collect_system_counts()
+    return {
+        "profile": active_profile_name(),
+        "counts": {
+            "computers": counts["computers"],
+            "codes": counts["codes"],
+            "workchains": counts["workchains"],
+        },
+        "daemon_status": _is_daemon_running(),
+    }
+def serialize_computers() -> list[dict[str, Any]]:
+    """Serialize all computers for API responses."""
+    computers = sorted(orm.Computer.collection.all(), key=lambda computer: computer.label.lower())
+    return [
+        {
+            "label": str(computer.label),
+            "hostname": str(computer.hostname),
+            "description": str(computer.description) if computer.description else None,
+        }
+        for computer in computers
+    ]
+
+
+def serialize_codes() -> list[dict[str, Any]]:
+    """Serialize all codes for API responses."""
+    codes = sorted(orm.Code.collection.all(), key=lambda code: code.label.lower())
+    payload: list[dict[str, Any]] = []
+    for code in codes:
+        computer_label = None
+        try:
+            computer = code.computer
+            computer_label = str(computer.label) if computer is not None else None
+        except Exception:  # noqa: BLE001
+            computer_label = None
+
+        payload.append(
+            {
+                "label": str(code.label),
+                "default_plugin": str(getattr(code, "default_calc_job_plugin", "") or "") or None,
+                "computer_label": computer_label,
+            }
+        )
+    return payload

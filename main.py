@@ -11,27 +11,15 @@ from core.engine import (
     ensure_profile_loaded,
     ensure_script_registry_dir,
 )
-from models.schemas import JobValidationRequest, JobValidationResponse, ResourcesResponse, SpecResponse, SystemInfoResponse, ValidationResponse
 from routers.data import (
     data_router,
-    list_workflow_plugins,
-    management_database_summary,
-    management_resources,
     management_router,
-    management_statistics,
-    management_system_info,
     plugins_router,
 )
 from routers.execution import execution_router, management_execution_router
 from routers.process import process_router
 from routers.registry import registry_router
-from routers.submission import (
-    submission_router,
-    submission_spec,
-    submission_submit,
-    submission_validate,
-    submission_validate_job,
-)
+from routers.submission import submission_router
 
 app = FastAPI(
     title="AiiDA Bridge API",
@@ -81,55 +69,54 @@ app.include_router(registry_router)
 app.include_router(execution_router)
 
 
-# Legacy aliases kept for existing clients.
-@app.get("/plugins", response_model=list[str])
-def legacy_list_workflow_plugins() -> list[str]:
-    return list_workflow_plugins()
+@app.get("/")
+def root():
+    """Root endpoint for health checks and status summary."""
+    from core.engine import ensure_profile_loaded, get_system_info_payload
+    ensure_profile_loaded()
+    info = get_system_info_payload()
+    return {
+        "message": "AiiDA Bridge API is online",
+        "version": "2.0.0",
+        "status": info,
+    }
 
 
-@app.get("/system/info", response_model=SystemInfoResponse)
-def legacy_get_system_info() -> SystemInfoResponse:
-    return management_system_info()
+@app.get("/status")
+def root_status():
+    """Root status endpoint for SABR client compatibility."""
+    from core.engine import ensure_profile_loaded, get_system_info_payload
+    ensure_profile_loaded()
+    return get_system_info_payload()
 
 
-@app.get("/status", response_model=SystemInfoResponse)
-def legacy_get_status() -> SystemInfoResponse:
-    return management_system_info()
+@app.get("/plugins")
+def root_plugins():
+    """Root plugins endpoint for SABR client compatibility."""
+    from aiida.plugins.entry_point import get_entry_point_names
+    return sorted(get_entry_point_names("aiida.workflows"))
 
 
-@app.get("/resources", response_model=ResourcesResponse)
-def legacy_get_resources() -> ResourcesResponse:
-    return management_resources()
+@app.get("/system/info")
+def root_system_info():
+    """Root system info endpoint for SABR client compatibility."""
+    from core.engine import ensure_profile_loaded, get_system_info_payload
+    ensure_profile_loaded()
+    return get_system_info_payload()
 
 
-@app.get("/statistics")
-def legacy_get_statistics() -> dict[str, Any]:
-    return management_statistics()
+@app.get("/resources")
+def root_resources():
+    """Root resources endpoint for SABR client compatibility."""
+    from core.engine import ensure_profile_loaded, serialize_codes, serialize_computers
+    ensure_profile_loaded()
+    return {
+        "computers": serialize_computers(),
+        "codes": serialize_codes(),
+    }
 
 
-@app.get("/database/summary")
-def legacy_get_database_summary() -> dict[str, Any]:
-    return management_database_summary()
 
-
-@app.get("/spec/{entry_point:path}", response_model=SpecResponse)
-def legacy_get_workflow_spec(entry_point: str) -> SpecResponse:
-    return submission_spec(entry_point)
-
-
-@app.post("/validate", response_model=ValidationResponse)
-def legacy_validate_workflow_inputs(payload: dict[str, Any]) -> ValidationResponse:
-    return submission_validate(payload)
-
-
-@app.post("/validate-job", response_model=JobValidationResponse)
-def legacy_validate_job(payload: JobValidationRequest) -> JobValidationResponse:
-    return submission_validate_job(payload)
-
-
-@app.post("/submit")
-def legacy_submit_workflow(payload: dict[str, Any]) -> dict[str, Any]:
-    return submission_submit(payload)
 
 
 if __name__ == "__main__":

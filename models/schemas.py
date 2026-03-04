@@ -169,6 +169,28 @@ class SubmissionScriptRequest(BaseModel):
             self.entry_point = self.workchain
         return self
 
+
+class BuilderDraftResponse(BaseModel):
+    success: bool
+    status: str
+    entry_point: str
+    protocol: str | None = None
+    intent_data: dict[str, Any] = Field(default_factory=dict)
+    overrides: dict[str, Any] = Field(default_factory=dict)
+    signature: list[dict[str, Any]] = Field(default_factory=list)
+    pseudo_expectations: list[dict[str, Any]] = Field(default_factory=list)
+    builder_inputs: dict[str, Any] = Field(default_factory=dict)
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+    missing_ports: list[str] = Field(default_factory=list)
+    preview: str | None = None
+
+
+class BuilderScriptResponse(BaseModel):
+    entry_point: str
+    protocol: str | None = None
+    signature: list[dict[str, Any]] = Field(default_factory=list)
+    script: str
+
 class InfrastructureSetupRequest(BaseModel):
     # Computer fields
     computer_label: str = Field(..., min_length=1, max_length=255)

@@ -12,20 +12,20 @@ from fastapi import HTTPException, Query
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from aiida import orm
-from aiida.common.exceptions import MissingEntryPointError, NotExistent
-from aiida.engine.daemon.client import get_daemon_client
 from aiida.orm import Group, Node, ProcessNode, QueryBuilder
 from aiida.plugins import DataFactory
 from aiida.plugins.entry_point import get_entry_point_names
-
 from core.engine import (
     SessionCleanupAPIRouter,
     active_profile_name,
     current_mounted_archive,
     db_access_guard,
     ensure_profile_loaded,
+    get_system_info_payload,
     http_error,
     load_archive_profile,
+    serialize_codes as _serialize_codes,
+    serialize_computers as _serialize_computers,
     switch_profile,
 )
 from core.node_utils import (
@@ -66,7 +66,7 @@ _SOFT_DELETED_EXTRA_KEY = "sabr_soft_deleted"
 _SOFT_DELETED_AT_EXTRA_KEY = "sabr_soft_deleted_at"
 
 _NODE_CLASS_MAP: dict[str, type[Node]] = {
-    "ProcessNode": ProcessNode,
+    "ProcessNode": orm.ProcessNode,
     "WorkChainNode": orm.WorkChainNode,
     "StructureData": orm.StructureData,
 }
@@ -76,127 +76,9 @@ _DATA_ENTRY_POINT_ALIASES: dict[str, str] = {
 }
 
 
-def _is_daemon_running() -> bool:
-    try:
-        daemon_client = get_daemon_client()
-        return bool(getattr(daemon_client, "is_daemon_running", False))
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _serialize_computers() -> list[dict[str, Any]]:
-    computers = sorted(orm.Computer.collection.all(), key=lambda computer: computer.label.lower())
-    return [
-        {
-            "label": str(computer.label),
-            "hostname": str(computer.hostname),
-            "description": str(computer.description) if computer.description else None,
-        }
-        for computer in computers
-    ]
-
-
-def _serialize_codes() -> list[dict[str, Any]]:
-    codes = sorted(orm.Code.collection.all(), key=lambda code: code.label.lower())
-    payload: list[dict[str, Any]] = []
-    for code in codes:
-        computer_label = None
-        try:
-            computer = code.computer
-            computer_label = str(computer.label) if computer is not None else None
-        except Exception:  # noqa: BLE001
-            computer_label = None
-
-        payload.append(
-            {
-                "label": str(code.label),
-                "default_plugin": str(getattr(code, "default_calc_job_plugin", "") or "") or None,
-                "computer_label": computer_label,
-            }
-        )
-    return payload
-
-
-def _query_count(cls: type[Any], *, filters: dict[str, Any] | None = None) -> int:
-    qb = QueryBuilder()
-    qb.append(cls, filters=filters or {})
-    with db_access_guard(f"count:{cls.__name__}"):
-        return int(qb.count())
-
-
-def _collect_system_counts() -> dict[str, int]:
-    try:
-        groups_count = _query_count(Group)
-    except SQLAlchemyTimeoutError:
-        groups_count = 0
-    except Exception:  # noqa: BLE001
-        groups_count = 0
-
-    try:
-        nodes_count = _query_count(Node)
-    except SQLAlchemyTimeoutError:
-        nodes_count = 0
-    except Exception:  # noqa: BLE001
-        nodes_count = 0
-
-    try:
-        processes_count = _query_count(ProcessNode)
-    except SQLAlchemyTimeoutError:
-        processes_count = 0
-    except Exception:  # noqa: BLE001
-        processes_count = 0
-
-    try:
-        failed_count = _query_count(ProcessNode, filters={"exit_status": {"!==": 0}})
-    except SQLAlchemyTimeoutError:
-        failed_count = 0
-    except Exception:  # noqa: BLE001
-        failed_count = 0
-
-    try:
-        computers_count = _query_count(orm.Computer)
-    except SQLAlchemyTimeoutError:
-        computers_count = 0
-    except Exception:  # noqa: BLE001
-        computers_count = 0
-
-    try:
-        codes_count = _query_count(orm.Code)
-    except SQLAlchemyTimeoutError:
-        codes_count = 0
-    except Exception:  # noqa: BLE001
-        codes_count = 0
-
-    try:
-        workchains_count = len(get_entry_point_names("aiida.workflows"))
-    except Exception:  # noqa: BLE001
-        workchains_count = 0
-
-    return {
-        "computers": computers_count,
-        "codes": codes_count,
-        "workchains": workchains_count,
-        "groups": groups_count,
-        "nodes": nodes_count,
-        "processes": processes_count,
-        "failed_processes": failed_count,
-    }
-
-
-def _get_system_info_payload() -> dict[str, Any]:
-    counts = _collect_system_counts()
-    return {
-        "profile": active_profile_name(),
-        "counts": {
-            "computers": counts["computers"],
-            "codes": counts["codes"],
-            "workchains": counts["workchains"],
-        },
-        "daemon_status": _is_daemon_running(),
-    }
-
-
 def _get_statistics_payload() -> dict[str, Any]:
+    from core.engine import _collect_system_counts, _is_daemon_running
+
     counts = _collect_system_counts()
     return {
         "profile": active_profile_name(),
@@ -206,6 +88,8 @@ def _get_statistics_payload() -> dict[str, Any]:
 
 
 def _get_database_summary_payload() -> dict[str, Any]:
+    from core.engine import _collect_system_counts
+
     counts = _collect_system_counts()
     return {
         "status": "success",
@@ -917,7 +801,7 @@ def list_local_archives(path: str = ".") -> dict[str, Any]:
 @management_router.get("/system/info", response_model=SystemInfoResponse)
 def management_system_info() -> SystemInfoResponse:
     ensure_profile_loaded()
-    return SystemInfoResponse(**_get_system_info_payload())
+    return SystemInfoResponse(**get_system_info_payload())
 
 
 @management_router.get("/resources", response_model=ResourcesResponse)

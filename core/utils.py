@@ -48,6 +48,9 @@ def to_jsonable(value: Any) -> Any:
             "type": value.__class__.__name__,
         }
 
+    if value.__class__.__name__.startswith("ProcessBuilderNamespace"):
+        return {str(key): to_jsonable(item) for key, item in value.items()}
+
     if isinstance(value, Mapping):
         return {str(key): to_jsonable(item) for key, item in value.items()}
 

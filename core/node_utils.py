@@ -69,8 +69,15 @@ def shorten_path_for_preview(path: str | None, *, depth: int = 2) -> str | None:
     return f".../{'/'.join(segments[-max(1, depth):])}"
 
 
-def build_node_preview(node: orm.Node) -> dict[str, Any] | None:
-    if isinstance(node, orm.StructureData):
+from typing import Protocol
+
+class NodeSerializerStrategy(Protocol):
+    def build_preview(self, node: Any) -> dict[str, Any] | None: ...
+    def extract_payload(self, node: Any) -> Any: ...
+
+
+class StructureDataSerializer:
+    def build_preview(self, node: orm.StructureData) -> dict[str, Any] | None:
         atom_count: int | None = None
         with suppress(Exception):
             atom_count = len(node.sites)
@@ -78,11 +85,14 @@ def build_node_preview(node: orm.Node) -> dict[str, Any] | None:
             "formula": get_structure_formula(node),
             "atom_count": atom_count,
         }
+    def extract_payload(self, node: orm.StructureData) -> Any:
+        return node.get_formula()
 
-    if isinstance(node, orm.BandsData):
+
+class BandsDataSerializer:
+    def build_preview(self, node: orm.BandsData) -> dict[str, Any] | None:
         num_bands: int | None = None
         num_kpoints: int | None = None
-
         with suppress(Exception):
             bands = node.get_bands()
             shape = getattr(bands, "shape", None)
@@ -92,17 +102,16 @@ def build_node_preview(node: orm.Node) -> dict[str, Any] | None:
                     num_bands = int(shape[-1])
                 elif len(shape) == 1:
                     num_bands = int(shape[0])
-
         with suppress(Exception):
             kpoints = node.get_kpoints()
             num_kpoints = len(kpoints)
+        return {"num_bands": num_bands, "num_kpoints": num_kpoints}
+    def extract_payload(self, node: orm.BandsData) -> Any:
+        return "BandsStructure"
 
-        return {
-            "num_bands": num_bands,
-            "num_kpoints": num_kpoints,
-        }
 
-    if isinstance(node, orm.ArrayData):
+class ArrayDataSerializer:
+    def build_preview(self, node: orm.ArrayData) -> dict[str, Any] | None:
         array_names: list[str] = []
         array_shapes: list[list[int] | None] = []
         with suppress(Exception):
@@ -116,12 +125,13 @@ def build_node_preview(node: orm.Node) -> dict[str, Any] | None:
                         array = node.get_array(name)
                         shape = [int(dimension) for dimension in getattr(array, "shape", ())]
                 array_shapes.append(shape)
-        return {
-            "arrays": array_names,
-            "shapes": array_shapes,
-        }
+        return {"arrays": array_names, "shapes": array_shapes}
+    def extract_payload(self, node: orm.ArrayData) -> Any:
+        return None
 
-    if isinstance(node, orm.RemoteData):
+
+class RemoteDataSerializer:
+    def build_preview(self, node: orm.RemoteData) -> dict[str, Any] | None:
         computer_label: str | None = None
         with suppress(Exception):
             computer = getattr(node, "computer", None)
@@ -130,84 +140,125 @@ def build_node_preview(node: orm.Node) -> dict[str, Any] | None:
         remote_path: str | None = None
         with suppress(Exception):
             remote_path = str(node.get_remote_path())
-        return {
-            "computer": computer_label or None,
-            "path": shorten_path_for_preview(remote_path),
-        }
+        return {"computer": computer_label or None, "path": shorten_path_for_preview(remote_path)}
+    def extract_payload(self, node: orm.RemoteData) -> Any:
+        return None
 
-    if isinstance(node, orm.FolderData):
+
+class FolderDataSerializer:
+    def build_preview(self, node: orm.FolderData) -> dict[str, Any] | None:
         file_names: list[str] = []
         with suppress(Exception):
             file_names = sorted([str(name) for name in node.list_object_names()])
-        return {
-            "file_count": len(file_names),
-            "files": file_names[:3],
-        }
+        return {"file_count": len(file_names), "files": file_names[:3]}
+    def extract_payload(self, node: orm.FolderData) -> Any:
+        return node.list_object_names()
 
-    if isinstance(node, orm.ProcessNode):
+
+class ProcessNodeSerializer:
+    def build_preview(self, node: orm.ProcessNode) -> dict[str, Any] | None:
         state = extract_process_state_value(node)
-        return {
-            "state": state,
-            "execution_time_seconds": compute_process_execution_time_seconds(node, state=state),
-        }
+        return {"state": state, "execution_time_seconds": compute_process_execution_time_seconds(node, state=state)}
+    def extract_payload(self, node: orm.ProcessNode) -> Any:
+        return None
 
-    if isinstance(node, orm.Dict):
+
+class DictSerializer:
+    def build_preview(self, node: orm.Dict) -> dict[str, Any] | None:
         d = node.get_dict()
         keys = list(d.keys())
-        return {
-            "keys": keys[:5],
-            "count": len(keys),
-            "summary": str(d)[:100] + ("..." if len(str(d)) > 100 else "")
-        }
+        return {"keys": keys[:5], "count": len(keys), "summary": str(d)[:100] + ("..." if len(str(d)) > 100 else "")}
+    def extract_payload(self, node: orm.Dict) -> Any:
+        return node.get_dict()
 
-    if isinstance(node, (orm.List, orm.ArrayData)):
+
+class ListSerializer:
+    def build_preview(self, node: orm.List) -> dict[str, Any] | None:
+        with suppress(Exception):
+            l = node.get_list()
+            return {"count": len(l), "summary": str(l)[:100] + ("..." if len(str(l)) > 100 else "")}
+        return None
+    def extract_payload(self, node: orm.List) -> Any:
+        return node.get_list()
+
+
+class ScalarSerializer:
+    def build_preview(self, node: Any) -> dict[str, Any] | None:
+        return {"value": str(getattr(node, "value", ""))}
+    def extract_payload(self, node: Any) -> Any:
+        return getattr(node, "value", None)
+
+
+class CodeSerializer:
+    def build_preview(self, node: orm.Code) -> dict[str, Any] | None:
+        return None
+    def extract_payload(self, node: orm.Code) -> Any:
+        return node.full_label
+
+
+class KpointsDataSerializer:
+    def build_preview(self, node: orm.KpointsData) -> dict[str, Any] | None:
+        return None
+    def extract_payload(self, node: orm.KpointsData) -> Any:
         try:
-            if isinstance(node, orm.List):
-                l = node.get_list()
-                return {"count": len(l), "summary": str(l)[:100] + ("..." if len(str(l)) > 100 else "")}
+            mesh, offset = node.get_kpoints_mesh()
+            return {"mode": "mesh", "mesh": to_jsonable(mesh), "offset": to_jsonable(offset)}
         except Exception:
-            pass
+            with suppress(Exception):
+                kpoints = node.get_kpoints()
+                return {"mode": "list", "num_points": len(kpoints), "points": to_jsonable(kpoints.tolist())}
+        return None
 
-    if isinstance(node, (orm.Int, orm.Float, orm.Str, orm.Bool)):
-        return {"value": str(node.value)}
 
+_SCALAR_SERIALIZER = ScalarSerializer()
+
+NODE_SERIALIZERS: dict[type[orm.Node], NodeSerializerStrategy] = {
+    orm.StructureData: StructureDataSerializer(),
+    orm.BandsData: BandsDataSerializer(),
+    orm.ArrayData: ArrayDataSerializer(),
+    orm.RemoteData: RemoteDataSerializer(),
+    orm.FolderData: FolderDataSerializer(),
+    orm.ProcessNode: ProcessNodeSerializer(),
+    orm.Dict: DictSerializer(),
+    orm.List: ListSerializer(),
+    orm.Int: _SCALAR_SERIALIZER,
+    orm.Float: _SCALAR_SERIALIZER,
+    orm.Str: _SCALAR_SERIALIZER,
+    orm.Bool: _SCALAR_SERIALIZER,
+    orm.Code: CodeSerializer(),
+    orm.KpointsData: KpointsDataSerializer(),
+}
+
+
+def _get_serializer(node: orm.Node) -> NodeSerializerStrategy | None:
+    # Exact match first
+    node_type = type(node)
+    if node_type in NODE_SERIALIZERS:
+        return NODE_SERIALIZERS[node_type]
+    
+    # Subclass match
+    for base_type, serializer in NODE_SERIALIZERS.items():
+        if isinstance(node, base_type):
+            return serializer
+            
+    return None
+
+
+def build_node_preview(node: orm.Node) -> dict[str, Any] | None:
+    serializer = _get_serializer(node)
+    if serializer:
+        return serializer.build_preview(node)
     return None
 
 
 def extract_node_payload(node: orm.Node) -> Any:
+    serializer = _get_serializer(node)
     payload = None
-    try:
-        if isinstance(node, orm.Dict):
-            payload = node.get_dict()
-        elif isinstance(node, orm.FolderData):
-            payload = node.list_object_names()
-        elif isinstance(node, orm.StructureData):
-            payload = node.get_formula()
-        elif isinstance(node, orm.BandsData):
-            payload = "BandsStructure"
-        elif isinstance(node, orm.Code):
-            payload = node.full_label
-        elif isinstance(node, (orm.Int, orm.Float, orm.Str, orm.Bool)):
-            payload = node.value
-        elif isinstance(node, orm.KpointsData):
-            try:
-                mesh, offset = node.get_kpoints_mesh()
-                payload = {
-                    "mode": "mesh",
-                    "mesh": to_jsonable(mesh),
-                    "offset": to_jsonable(offset),
-                }
-            except Exception:
-                with suppress(Exception):
-                    kpoints = node.get_kpoints()
-                    payload = {
-                        "mode": "list",
-                        "num_points": len(kpoints),
-                        "points": to_jsonable(kpoints.tolist()),
-                    }
-    except Exception:  # noqa: BLE001
-        payload = "Error loading content"
-
+    if serializer:
+        try:
+            payload = serializer.extract_payload(node)
+        except Exception:  # noqa: BLE001
+            payload = "Error loading content"
     return to_jsonable(payload)
 
 

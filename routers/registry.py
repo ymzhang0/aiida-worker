@@ -28,6 +28,15 @@ def registry_register(payload: ScriptRegisterRequest) -> dict[str, Any]:
     )
 
 
+@registry_router.get("/workchains/{entry_point:path}/spec")
+def registry_workchain_spec(entry_point: str) -> Any:
+    """
+    Alias to submission/spec.
+    """
+    from routers.submission import submission_spec
+    return submission_spec(entry_point)
+
+
 @registry_router.get("/{script_name}")
 def registry_get(script_name: str, include_content: bool = Query(default=True)) -> dict[str, Any]:
     ensure_profile_loaded()
