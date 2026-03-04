@@ -315,22 +315,22 @@ def get_node_summary(node_pk: int) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         outgoing_count = 0
 
-    state_value = extract_process_state_value(node, default="N/A")
-    preview = build_node_preview(node)
+    info = serialize_node(node)
+    
+    # ProcessNode specific fields might already be populated by serialize_node,
+    # but get_node_summary explicitly returns them even if empty or defaults
+    if "state" not in info:
+        info["state"] = "N/A"
+    if "process_label" not in info:
+        info["process_label"] = "N/A"
+    if "exit_status" not in info:
+        info["exit_status"] = "N/A"
 
-    return {
-        "pk": int(node.pk),
-        "uuid": str(node.uuid),
-        "type": node_type_name(node),
-        "full_type": str(getattr(node, "node_type", node.__class__.__name__)),
-        "ctime": node.ctime.strftime("%Y-%m-%d %H:%M:%S") if getattr(node, "ctime", None) else None,
-        "label": str(getattr(node, "label", None) or "(No Label)"),
-        "state": state_value,
-        "process_label": str(getattr(node, "process_label", None) or "N/A"),
-        "exit_status": getattr(node, "exit_status", "N/A"),
-        "incoming": incoming_count,
-        "outgoing": outgoing_count,
-        "attributes": to_jsonable(node.base.attributes.all),
-        "preview_info": preview,
-        "preview": preview,
-    }
+    info["incoming"] = incoming_count
+    info["outgoing"] = outgoing_count
+    info["attributes"] = to_jsonable(node.base.attributes.all)
+    
+    # Remove payload from summary for lightweight response
+    info.pop("payload", None)
+
+    return info

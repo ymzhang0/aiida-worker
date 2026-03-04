@@ -17,8 +17,11 @@ AiiDA-Worker exposes the state of the local AiiDA profile via deterministic REST
 **Implementation:** A raw standard python execution sandbox is available at `/management/run-python`. It creates a local `exec()` dictionary containing `orm`, `plugins`, and `engine` to give SABR full, unhindered access to the AiiDA Core API, capturing trailing output via `io.StringIO()` buffering.
 
 ### Data Aggregation (Body side of Presentation)
-**Location:** `routers/process.py`, `core/node_utils.py`
-**Implementation:** Endpoints like `/process/{identifier}` implement heavy lifting (such as using `defaultdict` for counting identical labels) and use `_ProcessTree` to iteratively compile the node structure recursively (`to_dict`). Logs are parsed efficiently using `QueryBuilder().append(orm.Log...`. This minimizes the payload footprint before sending it over the bridge to SABR's Presenters.
+**Location:** `routers/process.py`, `core/node_utils.py`, `core/process_utils.py`
+**Implementation:** Endpoints like `/process/{identifier}` implement heavy lifting (such as using `defaultdict` for counting identical labels) and use `ProcessTree` to iteratively compile the node structure recursively (`to_dict`). 
+- **Provenenance Links (Verbose):** Uses `base.links.get_incoming()` and `base.links.get_outgoing()` to capture the full provenance graph.
+- **Direct Links (Concise):** Uses `node.inputs._get_keys()` and `node.inputs._get_node_by_link_label()` to extract only the explicit port mappings, avoiding over-fetching of hidden subprocess inputs in WorkChains.
+- **Log Parsing:** Logs are parsed efficiently using `QueryBuilder().append(orm.Log...`. This minimizes the payload footprint before sending it over the bridge to SABR's Presenters.
 
 ## Technology Stack
 - **FastAPI / Pydantic:** Core structural API mapping.
