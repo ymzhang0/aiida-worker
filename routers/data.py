@@ -748,18 +748,39 @@ def management_current_user_info() -> dict[str, Any]:
 @management_router.post("/profiles/setup")
 def management_setup_profile(payload: ProfileSetupRequest) -> dict[str, Any]:
     try:
-        from aiida.manage.configuration import setup_profile
+        from aiida.manage.configuration import create_profile, get_config
         
-        setup_profile(
-            profile_name=payload.profile_name,
+        config = get_config()
+        
+        # Define storage configuration for sqlite_dos
+        storage_config = {
+            "filepath": str(Path(payload.filepath).expanduser().resolve())
+        }
+        
+        # Optional broker configuration (RabbitMQ)
+        broker_backend = "core.rabbitmq"
+        broker_config = {
+            "host": "localhost",
+            "port": 5672,
+        }
+
+        create_profile(
+            config=config,
+            storage_backend=payload.backend,
+            storage_config=storage_config,
+            broker_backend=broker_backend,
+            broker_config=broker_config,
+            name=payload.profile_name,
+            email=payload.email,
             first_name=payload.first_name,
             last_name=payload.last_name,
-            email=payload.email,
             institution=payload.institution,
-            filepath=payload.filepath,
-            backend=payload.backend,
-            set_as_default=payload.set_as_default,
+            is_test_profile=False,
         )
+        
+        # Store the updated config back to disk
+        config.store()
+        
         return {"status": "success", "profile_name": payload.profile_name}
     except Exception as exc:
         raise http_error(500, "Failed to setup profile programmatically", reason=str(exc))
@@ -1059,6 +1080,84 @@ def get_ssh_config() -> list[SSHHostDetails]:
 
     return hosts
 
+from models.schemas import (
+    CodeSetupRequest,
+    CodeDetailedResponse,
+    InfrastructureSetupRequest,
+    SSHHostDetails,
+)
+
+@management_router.post("/infrastructure/setup-code")
+def setup_code(payload: CodeSetupRequest):
+    """
+    Create and store an orm.InstalledCode for a given computer.
+    """
+    ensure_profile_loaded()
+    try:
+        computer = orm.Computer.collection.get(label=payload.computer_label)
+        
+        # Check if code already exists
+        existing_codes = orm.Code.collection.find(filters={'label': payload.label, 'attributes.remote_computer_uuid': computer.uuid})
+        if existing_codes:
+            code = existing_codes[0]
+        else:
+            code = orm.InstalledCode(
+                label=payload.label,
+                description=payload.description or "",
+                default_calc_job_plugin=payload.default_calc_job_plugin,
+                computer=computer,
+                filepath_executable=payload.remote_abspath
+            )
+        
+        if payload.prepend_text:
+            code.set_prepend_text(payload.prepend_text)
+        if payload.append_text:
+            code.set_append_text(payload.append_text)
+            
+        code.with_mpi = payload.with_mpi
+        code.use_double_quotes = payload.use_double_quotes
+        
+        code.store()
+        
+        return {
+            "status": "success",
+            "pk": int(code.pk),
+            "label": str(code.label)
+        }
+    except Exception as exc:
+        raise http_error(500, "Failed to setup code", reason=str(exc))
+
+@management_router.get("/infrastructure/computer/{computer_label}/codes", response_model=list[CodeDetailedResponse])
+def get_computer_codes(computer_label: str):
+    """
+    Return detailed information for all codes associated with a computer.
+    Used for providing suggestions/templates in the frontend.
+    """
+    ensure_profile_loaded()
+    try:
+        computer = orm.Computer.collection.get(label=computer_label)
+        codes = orm.Code.collection.find(filters={'attributes.remote_computer_uuid': computer.uuid})
+        
+        result = []
+        for code in codes:
+            # We only care about InstalledCode for templates usually, but AiiDA might return others
+            # In AiiDA 2.x, orm.Code might be a legacy class or a base class.
+            # We'll try to extract what we can.
+            result.append({
+                "pk": int(code.pk),
+                "label": str(code.label),
+                "description": str(code.description) if code.description else None,
+                "default_calc_job_plugin": str(getattr(code, "default_calc_job_plugin", "") or ""),
+                "remote_abspath": str(getattr(code, "filepath_executable", "") or ""),
+                "prepend_text": str(code.get_prepend_text()) if hasattr(code, 'get_prepend_text') else None,
+                "append_text": str(code.get_append_text()) if hasattr(code, 'get_append_text') else None,
+                "with_mpi": bool(getattr(code, 'with_mpi', False)),
+                "use_double_quotes": bool(getattr(code, 'use_double_quotes', False))
+            })
+        return result
+    except Exception as exc:
+        raise http_error(500, "Failed to fetch computer codes", reason=str(exc))
+
 @management_router.post("/infrastructure/setup")
 def setup_infrastructure(payload: InfrastructureSetupRequest):
     """
@@ -1077,9 +1176,9 @@ def setup_infrastructure(payload: InfrastructureSetupRequest):
                 description=payload.computer_description or "",
                 transport_type=payload.transport_type,
                 scheduler_type=payload.scheduler_type,
-                work_dir=payload.work_dir
+                workdir=payload.work_dir
             )
-        computer.set_mpiprocs_per_machine(payload.mpiprocs_per_machine)
+        computer.set_default_mpiprocs_per_machine(payload.mpiprocs_per_machine)
         if payload.mpirun_command:
             computer.set_mpirun_command(payload.mpirun_command.split())
         if payload.prepend_text:
