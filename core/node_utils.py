@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from datetime import datetime
+from pprint import pformat
 from typing import Any
 
 from aiida import orm
@@ -76,14 +77,158 @@ class NodeSerializerStrategy(Protocol):
     def extract_payload(self, node: Any) -> Any: ...
 
 
+def _format_python_literal(value: Any) -> str:
+    return pformat(to_jsonable(value), width=100, sort_dicts=False)
+
+
+def _extract_structure_script_parts(node: orm.StructureData) -> tuple[list[str], list[list[float]], list[list[float]], list[bool]]:
+    symbols: list[str] = []
+    positions: list[list[float]] = []
+    cell: list[list[float]] = []
+    pbc: list[bool] = [True, True, True]
+
+    with suppress(Exception):
+        atoms = node.get_ase()
+        symbols = [str(symbol) for symbol in atoms.get_chemical_symbols()]
+        positions = [[float(coord) for coord in row] for row in atoms.get_positions().tolist()]
+        cell = [[float(coord) for coord in row] for row in atoms.cell.tolist()]
+        pbc = [bool(flag) for flag in atoms.get_pbc().tolist()]
+        return symbols, positions, cell, pbc
+
+    kind_symbol_map: dict[str, str] = {}
+    with suppress(Exception):
+        for kind in node.kinds:
+            symbols_attr = getattr(kind, "symbols", None)
+            if isinstance(symbols_attr, (list, tuple)) and len(symbols_attr) == 1:
+                kind_symbol_map[str(kind.name)] = str(symbols_attr[0])
+            else:
+                kind_symbol_map[str(kind.name)] = str(getattr(kind, "symbol", None) or kind.name)
+
+    with suppress(Exception):
+        for site in node.sites:
+            kind_name = str(site.kind_name)
+            symbols.append(kind_symbol_map.get(kind_name, kind_name))
+            positions.append([float(coord) for coord in site.position])
+
+    with suppress(Exception):
+        cell = [[float(coord) for coord in row] for row in node.cell]
+
+    return symbols, positions, cell, pbc
+
+
+def _render_structure_script(node: orm.StructureData) -> str:
+    formula = get_structure_formula(node) or f"StructureData #{node.pk}"
+    symbols, positions, cell, pbc = _extract_structure_script_parts(node)
+    lines = [
+        f"# StructureData PK {int(node.pk)}: {formula}",
+        "from ase import Atoms",
+        "",
+        f"symbols = {_format_python_literal(symbols)}",
+        f"positions = {_format_python_literal(positions)}",
+        f"cell = {_format_python_literal(cell)}",
+        f"pbc = {_format_python_literal(pbc)}",
+        "",
+        "atoms = Atoms(",
+        "    symbols=symbols,",
+        "    positions=positions,",
+        "    cell=cell,",
+        "    pbc=pbc,",
+        ")",
+        "",
+        "# Optional: wrap back into AiiDA",
+        "# from aiida.orm import StructureData",
+        "# structure = StructureData(ase=atoms)",
+    ]
+    return "\n".join(lines)
+
+
+def _render_dict_script(node: orm.Dict) -> str:
+    payload = node.get_dict()
+    lines = [
+        f"# Dict PK {int(node.pk)}",
+        f"data = {_format_python_literal(payload)}",
+        "",
+        "# Optional: wrap back into AiiDA",
+        "# from aiida.orm import Dict",
+        "# data_node = Dict(dict=data)",
+    ]
+    return "\n".join(lines)
+
+
+def get_node_script_payload(node_pk: int) -> dict[str, Any]:
+    try:
+        node = orm.load_node(node_pk)
+    except Exception as exc:  # noqa: BLE001
+        raise http_error(404, "Node not found", pk=int(node_pk), reason=str(exc)) from exc
+
+    if isinstance(node, orm.StructureData):
+        script = _render_structure_script(node)
+    elif isinstance(node, orm.Dict):
+        script = _render_dict_script(node)
+    else:
+        raise http_error(
+            422,
+            "Copy as Script is only supported for StructureData and Dict nodes",
+            pk=int(node.pk),
+            node_type=node_type_name(node),
+        )
+
+    return {
+        "pk": int(node.pk),
+        "node_type": node_type_name(node),
+        "language": "python",
+        "script": script,
+    }
+
+
 class StructureDataSerializer:
     def build_preview(self, node: orm.StructureData) -> dict[str, Any] | None:
         atom_count: int | None = None
+        cell_volume: float | None = None
+        positions: list[dict[str, Any]] | None = None
+        symmetry: dict[str, Any] | None = None
+        lattice: dict[str, Any] | None = None
+
         with suppress(Exception):
             atom_count = len(node.sites)
+        with suppress(Exception):
+            cell_volume = node.get_cell_volume()
+        with suppress(Exception):
+            # Extract first 50 sites for preview
+            positions = []
+            for site in node.sites[:50]:
+                positions.append({
+                    "kind": str(site.kind_name),
+                    "position": [float(c) for c in site.position]
+                })
+
+        # Extra info using pymatgen
+        with suppress(Exception):
+            from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+            struct = node.get_pymatgen_structure()
+            sga = SpacegroupAnalyzer(struct)
+            symmetry = {
+                "number": int(sga.get_space_group_number()),
+                "symbol": str(sga.get_space_group_symbol()),
+                "crystal_system": str(sga.get_crystal_system()),
+            }
+            lat = struct.lattice
+            lattice = {
+                "a": float(lat.a),
+                "b": float(lat.b),
+                "c": float(lat.c),
+                "alpha": float(lat.alpha),
+                "beta": float(lat.beta),
+                "gamma": float(lat.gamma),
+            }
+
         return {
             "formula": get_structure_formula(node),
             "atom_count": atom_count,
+            "cell_volume": round(float(cell_volume), 4) if cell_volume is not None else None,
+            "positions": positions,
+            "symmetry": symmetry,
+            "lattice": lattice
         }
     def extract_payload(self, node: orm.StructureData) -> Any:
         return node.get_formula()
@@ -102,9 +247,10 @@ class BandsDataSerializer:
                     num_bands = int(shape[-1])
                 elif len(shape) == 1:
                     num_bands = int(shape[0])
-        with suppress(Exception):
-            kpoints = node.get_kpoints()
-            num_kpoints = len(kpoints)
+        if num_kpoints is None:
+            with suppress(Exception):
+                kpoints = node.get_kpoints()
+                num_kpoints = len(kpoints)
         return {"num_bands": num_bands, "num_kpoints": num_kpoints}
     def extract_payload(self, node: orm.BandsData) -> Any:
         return "BandsStructure"
@@ -112,20 +258,21 @@ class BandsDataSerializer:
 
 class ArrayDataSerializer:
     def build_preview(self, node: orm.ArrayData) -> dict[str, Any] | None:
-        array_names: list[str] = []
-        array_shapes: list[list[int] | None] = []
+        array_info: list[dict[str, Any]] = []
         with suppress(Exception):
             for name in node.get_arraynames():
-                array_names.append(str(name))
-                shape: list[int] | None = None
+                info: dict[str, Any] = {"name": str(name)}
                 with suppress(Exception):
-                    shape = [int(dimension) for dimension in node.get_shape(name)]
-                if shape is None:
-                    with suppress(Exception):
-                        array = node.get_array(name)
-                        shape = [int(dimension) for dimension in getattr(array, "shape", ())]
-                array_shapes.append(shape)
-        return {"arrays": array_names, "shapes": array_shapes}
+                    info["shape"] = [int(dimension) for dimension in node.get_shape(name)]
+                
+                # Get a sample of the array data (first 5 elements)
+                with suppress(Exception):
+                    array = node.get_array(name)
+                    # We use to_jsonable for numpy arrays
+                    info["data"] = to_jsonable(array.flatten()[:5].tolist())
+                
+                array_info.append(info)
+        return {"arrays": array_info}
     def extract_payload(self, node: orm.ArrayData) -> Any:
         return None
 
@@ -167,7 +314,17 @@ class DictSerializer:
     def build_preview(self, node: orm.Dict) -> dict[str, Any] | None:
         d = node.get_dict()
         keys = list(d.keys())
-        return {"keys": keys[:5], "count": len(keys), "summary": str(d)[:100] + ("..." if len(str(d)) > 100 else "")}
+        # For large dicts, we still want to return a significant chunk but maybe not megalobytes
+        # but 1MB of JSON is usually fine for a single node preview
+        serialized = str(d)
+        is_truncated = len(serialized) > 20000
+        summary = serialized[:20000] + ("..." if is_truncated else "")
+        return {
+            "keys": keys[:10],
+            "count": len(keys),
+            "summary": summary,
+            "data": d if not is_truncated else None # Only send full data if it's small
+        }
     def extract_payload(self, node: orm.Dict) -> Any:
         return node.get_dict()
 
@@ -196,6 +353,22 @@ class CodeSerializer:
         return node.full_label
 
 
+class XyDataSerializer:
+    def build_preview(self, node: orm.XyData) -> dict[str, Any] | None:
+        preview: dict[str, Any] = {}
+        with suppress(Exception):
+            x_name, x_array, x_units = node.get_x()
+            y_data = node.get_y()
+            preview["x_label"] = str(x_name)
+            preview["y_labels"] = [str(item[0]) for item in y_data]
+            preview["x_sample"] = to_jsonable(x_array.tolist()[:5])
+            if y_data:
+                preview["y_sample"] = to_jsonable(y_data[0][1].tolist()[:5])
+        return preview
+    def extract_payload(self, node: orm.XyData) -> Any:
+        return None
+
+
 class KpointsDataSerializer:
     def build_preview(self, node: orm.KpointsData) -> dict[str, Any] | None:
         return None
@@ -221,6 +394,7 @@ NODE_SERIALIZERS: dict[type[orm.Node], NodeSerializerStrategy] = {
     orm.ProcessNode: ProcessNodeSerializer(),
     orm.Dict: DictSerializer(),
     orm.List: ListSerializer(),
+    orm.XyData: XyDataSerializer(),
     orm.Int: _SCALAR_SERIALIZER,
     orm.Float: _SCALAR_SERIALIZER,
     orm.Str: _SCALAR_SERIALIZER,
@@ -249,6 +423,45 @@ def build_node_preview(node: orm.Node) -> dict[str, Any] | None:
     if serializer:
         return serializer.build_preview(node)
     return None
+
+
+def serialize_links(node: orm.Node, mode: str = "incoming") -> dict[str, Any]:
+    """
+    Serialize incoming or outgoing links for a node.
+    Returns a dictionary mapping link_label to a preview of the linked node.
+    """
+    links = {}
+    with suppress(Exception):
+        if mode == "incoming":
+            link_list = node.base.links.get_incoming().all()
+        else:
+            link_list = node.base.links.get_outgoing().all()
+
+        for link_item in link_list:
+            linked_node = link_item.node
+            link_label = str(link_item.link_label)
+            
+            # Use node_type_name for better display
+            node_type = node_type_name(linked_node)
+            
+            preview = build_node_preview(linked_node)
+            
+            links[link_label] = {
+                "pk": int(linked_node.pk),
+                "uuid": str(linked_node.uuid),
+                "node_type": node_type,
+                "label": str(linked_node.label or node_type),
+                "link_label": link_label,
+                "preview_info": preview,
+                "preview": preview, # compatibility
+            }
+            # Process specific fields if available
+            if isinstance(linked_node, orm.ProcessNode):
+                links[link_label]["process_state"] = extract_process_state_value(linked_node)
+                links[link_label]["process_label"] = str(getattr(linked_node, "process_label", "N/A") or "N/A")
+                links[link_label]["exit_status"] = getattr(linked_node, "exit_status", None)
+
+    return links
 
 
 def extract_node_payload(node: orm.Node) -> Any:
@@ -330,6 +543,12 @@ def get_node_summary(node_pk: int) -> dict[str, Any]:
     info["outgoing"] = outgoing_count
     info["attributes"] = to_jsonable(node.base.attributes.all)
     
+    # Detailed links for the preview drawer
+    info["inputs"] = serialize_links(node, mode="incoming")
+    info["outputs"] = serialize_links(node, mode="outgoing")
+    info["direct_inputs"] = info["inputs"]
+    info["direct_outputs"] = info["outputs"]
+
     # Remove payload from summary for lightweight response
     info.pop("payload", None)
 

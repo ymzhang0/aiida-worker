@@ -8,7 +8,294 @@ from aiida import orm
 from aiida.orm import QueryBuilder
 
 from core.engine import http_error
-from core.node_utils import node_type_name, serialize_node
+from core.node_utils import get_structure_formula, node_type_name, serialize_node
+from core.submission_utils import _load_workflow, _prepare_and_validate
+from core.utils import to_jsonable
+
+
+_PARALLEL_SETTING_KEYS = {
+    "num_machines",
+    "num_mpiprocs_per_machine",
+    "tot_num_mpiprocs",
+    "num_cores_per_machine",
+    "num_cores_per_mpiproc",
+    "npool",
+    "nk",
+    "ntg",
+    "ndiag",
+    "withmpi",
+    "queue_name",
+    "account",
+    "qos",
+    "max_wallclock_seconds",
+}
+
+
+def _merge_nested_dicts(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in overlay.items():
+        existing = merged.get(key)
+        if isinstance(existing, Mapping) and isinstance(value, Mapping):
+            merged[str(key)] = _merge_nested_dicts(existing, value)
+        else:
+            merged[str(key)] = value
+    return merged
+
+
+def _is_nested_inputs_manager(value: Any) -> bool:
+    if hasattr(value, "_get_keys") and hasattr(value, "_get_node_by_link_label"):
+        return True
+    return hasattr(value, "keys") and not isinstance(value, Mapping)
+
+
+def _iterate_inputs_manager(manager: Any) -> list[tuple[str, Any]]:
+    entries: list[tuple[str, Any]] = []
+    if hasattr(manager, "_get_keys") and hasattr(manager, "_get_node_by_link_label"):
+        try:
+            for key in manager._get_keys():
+                entries.append((str(key), manager._get_node_by_link_label(key)))
+            return entries
+        except Exception:
+            entries = []
+
+    try:
+        keys = manager.keys()
+    except Exception:
+        return entries
+
+    for key in keys:
+        key_text = str(key).strip()
+        if not key_text:
+            continue
+        try:
+            entries.append((key_text, manager[key]))
+        except Exception:
+            continue
+    return entries
+
+
+def _append_pk_map_entry(
+    entries: list[dict[str, Any]],
+    seen: set[tuple[int, str]],
+    *,
+    pk: int,
+    path: str,
+    label: str,
+) -> None:
+    dedupe_key = (pk, path)
+    if dedupe_key in seen:
+        return
+    seen.add(dedupe_key)
+    entries.append({"pk": int(pk), "path": path, "label": label})
+
+
+def _append_structure_metadata_entry(
+    entries: list[dict[str, Any]],
+    seen: set[tuple[int, str]],
+    *,
+    node: orm.StructureData,
+    path: str,
+) -> None:
+    dedupe_key = (int(node.pk), path)
+    if dedupe_key in seen:
+        return
+    seen.add(dedupe_key)
+
+    atom_count: int | None = None
+    with suppress(Exception):
+        atom_count = len(node.sites)
+
+    symmetry_label: str | None = None
+    with suppress(Exception):
+        from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+
+        analyzer = SpacegroupAnalyzer(node.get_pymatgen_structure())
+        symbol = str(analyzer.get_space_group_symbol())
+        number = int(analyzer.get_space_group_number())
+        symmetry_label = f"{symbol} ({number})"
+
+    entries.append(
+        {
+            "pk": int(node.pk),
+            "path": path,
+            "label": str(node.label or get_structure_formula(node) or f"Structure #{node.pk}"),
+            "formula": get_structure_formula(node),
+            "symmetry": symmetry_label,
+            "num_atoms": atom_count,
+        }
+    )
+
+
+def _serialize_code_input(code: Any) -> str:
+    for attr_name in ("full_label",):
+        value = getattr(code, attr_name, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    label = str(getattr(code, "label", "") or "").strip()
+    computer = getattr(code, "computer", None)
+    computer_label = str(getattr(computer, "label", "") or "").strip() if computer is not None else ""
+    if label and computer_label:
+        return f"{label}@{computer_label}"
+    if label:
+        return label
+    return str(getattr(code, "pk", "") or "").strip()
+
+
+def _serialize_submission_node_value(
+    node: orm.Node,
+    *,
+    path: str,
+    pk_map_entries: list[dict[str, Any]],
+    pk_map_seen: set[tuple[int, str]],
+    structure_metadata: list[dict[str, Any]],
+    structure_seen: set[tuple[int, str]],
+    state: dict[str, Any],
+) -> Any:
+    if isinstance(node, orm.Dict):
+        return to_jsonable(node.get_dict())
+    if isinstance(node, orm.List):
+        return to_jsonable(node.get_list())
+    if isinstance(node, orm.Int):
+        return int(node.value)
+    if isinstance(node, orm.Float):
+        return float(node.value)
+    if isinstance(node, orm.Bool):
+        return bool(node.value)
+    if isinstance(node, orm.Str):
+        return str(node.value)
+
+    abstract_code = getattr(orm, "AbstractCode", None)
+    if isinstance(abstract_code, type) and isinstance(node, abstract_code):
+        computer = getattr(node, "computer", None)
+        computer_label = str(getattr(computer, "label", "") or "").strip() if computer is not None else ""
+        if computer_label and not state.get("target_computer"):
+            state["target_computer"] = computer_label
+        return _serialize_code_input(node)
+    if isinstance(node, orm.Code):
+        computer = getattr(node, "computer", None)
+        computer_label = str(getattr(computer, "label", "") or "").strip() if computer is not None else ""
+        if computer_label and not state.get("target_computer"):
+            state["target_computer"] = computer_label
+        return _serialize_code_input(node)
+
+    _append_pk_map_entry(
+        pk_map_entries,
+        pk_map_seen,
+        pk=int(node.pk),
+        path=path,
+        label=path.rsplit(".", 1)[-1] if path else "pk",
+    )
+
+    if isinstance(node, orm.StructureData):
+        _append_structure_metadata_entry(
+            structure_metadata,
+            structure_seen,
+            node=node,
+            path=path,
+        )
+
+    return int(node.pk)
+
+
+def _serialize_process_inputs(
+    manager: Any,
+    *,
+    prefix: str = "",
+    pk_map_entries: list[dict[str, Any]],
+    pk_map_seen: set[tuple[int, str]],
+    structure_metadata: list[dict[str, Any]],
+    structure_seen: set[tuple[int, str]],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for key, value in _iterate_inputs_manager(manager):
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, orm.Node):
+            payload[key] = _serialize_submission_node_value(
+                value,
+                path=path,
+                pk_map_entries=pk_map_entries,
+                pk_map_seen=pk_map_seen,
+                structure_metadata=structure_metadata,
+                structure_seen=structure_seen,
+                state=state,
+            )
+            continue
+        if _is_nested_inputs_manager(value):
+            payload[key] = _serialize_process_inputs(
+                value,
+                prefix=path,
+                pk_map_entries=pk_map_entries,
+                pk_map_seen=pk_map_seen,
+                structure_metadata=structure_metadata,
+                structure_seen=structure_seen,
+                state=state,
+            )
+            continue
+        payload[key] = to_jsonable(value)
+    return payload
+
+
+def _collect_parallel_settings(payload: Any) -> dict[str, Any]:
+    settings: dict[str, Any] = {}
+
+    def walk(node: Any) -> None:
+        if isinstance(node, Mapping):
+            for key, value in node.items():
+                lowered = str(key).strip().lower()
+                if lowered in _PARALLEL_SETTING_KEYS and lowered not in settings:
+                    settings[lowered] = to_jsonable(value)
+                if isinstance(value, Mapping):
+                    walk(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, (Mapping, list)):
+                            walk(item)
+        elif isinstance(node, list):
+            for item in node:
+                if isinstance(item, (Mapping, list)):
+                    walk(item)
+
+    walk(payload)
+    return settings
+
+
+def _build_clone_validation_payload(entry_point: str, inputs: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        workflow = _load_workflow(entry_point)
+        _, validation_error = _prepare_and_validate(workflow, inputs)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "VALIDATION_FAILED",
+            "is_valid": False,
+            "errors": [str(exc)],
+            "warnings": [],
+            "source": "process.clone_draft",
+            "entry_point": entry_point,
+        }
+
+    if validation_error is None:
+        return {
+            "status": "VALIDATION_OK",
+            "is_valid": True,
+            "errors": [],
+            "warnings": [],
+            "source": "process.clone_draft",
+            "entry_point": entry_point,
+        }
+
+    message = str(getattr(validation_error, "message", "") or str(validation_error)).strip()
+    return {
+        "status": "VALIDATION_FAILED",
+        "is_valid": False,
+        "errors": [message] if message else [str(validation_error)],
+        "warnings": [],
+        "source": "process.clone_draft",
+        "entry_point": entry_point,
+        "port": str(getattr(validation_error, "port", "") or ""),
+        "full_error": str(validation_error),
+    }
 
 
 def _get_process_summary(node: orm.ProcessNode) -> dict[str, Any]:
@@ -211,28 +498,104 @@ def inspect_workchain_node(node: orm.WorkChainNode) -> dict[str, Any]:
     return {"provenance_tree": tree.to_dict()}
 
 
+def build_process_clone_payload(identifier_or_node: int | str | orm.ProcessNode) -> dict[str, Any]:
+    if isinstance(identifier_or_node, orm.ProcessNode):
+        node = identifier_or_node
+    else:
+        try:
+            node = orm.load_node(identifier_or_node)
+        except Exception as exc:  # noqa: BLE001
+            raise http_error(404, "Process node not found", identifier=str(identifier_or_node), reason=str(exc)) from exc
+
+    if not isinstance(node, orm.ProcessNode):
+        raise http_error(400, "Node is not a ProcessNode", identifier=str(getattr(node, "pk", identifier_or_node)))
+    if not isinstance(node, orm.WorkflowNode):
+        raise http_error(
+            422,
+            "Clone & Edit is only supported for workflow processes",
+            identifier=str(getattr(node, "pk", identifier_or_node)),
+            node_type=node.__class__.__name__,
+        )
+
+    entry_point = str(getattr(node, "process_type", "") or "").strip()
+    if not entry_point:
+        raise http_error(422, "Workflow entry point is unavailable for this process", identifier=str(node.pk))
+
+    pk_map_entries: list[dict[str, Any]] = []
+    pk_map_seen: set[tuple[int, str]] = set()
+    structure_metadata: list[dict[str, Any]] = []
+    structure_seen: set[tuple[int, str]] = set()
+    state: dict[str, Any] = {"target_computer": None}
+
+    inputs = _serialize_process_inputs(
+        node.inputs,
+        pk_map_entries=pk_map_entries,
+        pk_map_seen=pk_map_seen,
+        structure_metadata=structure_metadata,
+        structure_seen=structure_seen,
+        state=state,
+    )
+
+    metadata_inputs = node.base.attributes.all.get("metadata_inputs")
+    if isinstance(metadata_inputs, Mapping):
+        inputs = _merge_nested_dicts(inputs, to_jsonable(dict(metadata_inputs)))
+
+    validation = _build_clone_validation_payload(entry_point, inputs)
+    process_label = str(getattr(node, "process_label", "") or entry_point or "AiiDA Workflow").strip()
+    parallel_settings = _collect_parallel_settings(inputs)
+
+    return {
+        "process_label": process_label or "AiiDA Workflow",
+        "entry_point": entry_point,
+        "inputs": inputs,
+        "recommended_inputs": {},
+        "advanced_settings": {},
+        "meta": {
+            "draft": {
+                "entry_point": entry_point,
+                "inputs": inputs,
+            },
+            "entry_point": entry_point,
+            "workchain": entry_point,
+            "workchain_entry_point": entry_point,
+            "pk_map": pk_map_entries,
+            "target_computer": state.get("target_computer"),
+            "parallel_settings": parallel_settings,
+            "structure_metadata": structure_metadata,
+            "validation": validation,
+            "source_process_pk": int(node.pk),
+            "source_process_uuid": str(node.uuid),
+        },
+    }
+
+
 def inspect_process_payload(identifier: str | int) -> dict[str, Any]:
     try:
         node = orm.load_node(identifier)
     except Exception as exc:  # noqa: BLE001
-        raise http_error(404, "Process node not found", identifier=str(identifier), reason=str(exc)) from exc
+        raise http_error(404, "Node not found", identifier=str(identifier), reason=str(exc)) from exc
 
-    if not isinstance(node, orm.ProcessNode):
-        raise http_error(400, "Node is not a ProcessNode", identifier=str(identifier))
-
+    # Use serialize_node for a consistent summary
+    summary = serialize_node(node)
+    
     payload: dict[str, Any] = {
-        "summary": _get_process_summary(node),
+        "summary": summary,
         "inputs": _get_links_dict(node, "incoming"),
         "outputs": _get_links_dict(node, "outgoing"),
         "direct_inputs": _get_direct_links_dict(node, "incoming"),
         "direct_outputs": _get_direct_links_dict(node, "outgoing"),
-        "logs": get_process_log_payload(node),
     }
 
-    if isinstance(node, (orm.CalcJobNode, orm.CalcFunctionNode)):
-        payload["calculation"] = inspect_calculation_node(node)
+    if isinstance(node, orm.ProcessNode):
+        payload["logs"] = get_process_log_payload(node)
+        
+        if isinstance(node, (orm.CalcJobNode, orm.CalcFunctionNode)):
+            payload["calculation"] = inspect_calculation_node(node)
 
-    if isinstance(node, orm.WorkflowNode):
-        payload["workchain"] = inspect_workchain_node(node)
+        if isinstance(node, orm.WorkflowNode):
+            payload["workchain"] = inspect_workchain_node(node)
+    else:
+        # Non-process nodes don't have logs or complex execution info
+        payload["logs"] = {"pk": int(node.pk), "text": "No logs for data nodes.", "lines": [], "reports": []}
 
     return payload

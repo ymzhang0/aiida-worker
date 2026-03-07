@@ -8,10 +8,11 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from fastapi import HTTPException, Query
+from fastapi import HTTPException, Query, UploadFile, File, Form, Depends
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from aiida import orm
+from aiida.common.exceptions import MissingEntryPointError
 from aiida.orm import Group, Node, ProcessNode, QueryBuilder
 from aiida.plugins import DataFactory
 from aiida.plugins.entry_point import get_entry_point_names
@@ -31,10 +32,12 @@ from core.engine import (
 from core.node_utils import (
     build_node_preview,
     extract_process_state_value,
+    get_node_script_payload,
     get_node_summary,
     get_structure_formula,
     node_type_name,
 )
+from core.data_importers import create_node_from_file
 from core.utils import to_jsonable
 from models.schemas import (
     ArchiveLoadRequest,
@@ -45,6 +48,7 @@ from models.schemas import (
     GroupCreateRequest,
     GroupRenameRequest,
     InfrastructureSetupRequest,
+    NodeScriptResponse,
     NodeSoftDeleteRequest,
     ProfileSetupRequest,
     ProfileSwitchRequest,
@@ -53,6 +57,7 @@ from models.schemas import (
     SystemInfoResponse,
     UserInfoResponse,
 )
+from specializations import get_data_entry_point_aliases
 
 management_router = SessionCleanupAPIRouter(prefix="/management", tags=["management"])
 data_router = SessionCleanupAPIRouter(prefix="/data", tags=["data"])
@@ -71,9 +76,7 @@ _NODE_CLASS_MAP: dict[str, type[Node]] = {
     "StructureData": orm.StructureData,
 }
 
-_DATA_ENTRY_POINT_ALIASES: dict[str, str] = {
-    "UpfData": "pseudo.upf",
-}
+_DATA_ENTRY_POINT_ALIASES: dict[str, str] = get_data_entry_point_aliases()
 
 
 def _get_statistics_payload() -> dict[str, Any]:
@@ -930,6 +933,12 @@ def management_node_summary(pk: int) -> dict[str, Any]:
     return get_node_summary(pk)
 
 
+@management_router.get("/nodes/{pk}/script", response_model=NodeScriptResponse)
+def management_node_script(pk: int) -> NodeScriptResponse:
+    ensure_profile_loaded()
+    return NodeScriptResponse(**get_node_script_payload(pk))
+
+
 @management_router.post("/nodes/context")
 def management_context_nodes(payload: ContextNodesRequest) -> dict[str, Any]:
     ensure_profile_loaded()
@@ -983,6 +992,57 @@ def data_remote_file_content(pk: int, filename: str) -> dict[str, Any]:
 def data_repository_file_content(pk: int, filename: str, source: str = Query(default="folder")) -> dict[str, Any]:
     ensure_profile_loaded()
     return _get_node_file_content(pk, filename, source=source)
+
+
+@data_router.post("/import/{data_type}")
+async def data_import_node(
+    data_type: str,
+    file: UploadFile | None = File(None),
+    source_type: str = Form("file"),
+    raw_text: str | None = Form(None),
+    label: str | None = Form(None),
+    description: str | None = Form(None),
+) -> dict[str, Any]:
+    ensure_profile_loaded()
+    
+    if source_type == "file":
+        if not file:
+            raise http_error(400, "File is required when source_type is 'file'")
+        content = await file.read()
+        filename = file.filename or "uploaded_file"
+    else:
+        if not raw_text:
+            raise http_error(400, "raw_text is required when source_type is 'raw_text'")
+        content = raw_text
+        filename = None
+
+    if not content:
+        raise http_error(400, "No content provided for import")
+        
+    try:
+        result = create_node_from_file(
+            data_type=data_type,
+            file_content=content,
+            filename=filename,
+            label=label,
+            description=description,
+            source_type=source_type,
+        )
+        
+        if isinstance(result, dict) and result.get("status") == "success":
+            return result
+
+        node = result
+        return {
+            "status": "success",
+            "pk": int(node.pk),
+            "uuid": str(node.uuid),
+            "type": node_type_name(node),
+        }
+    except ValueError as exc:
+        raise http_error(400, str(exc))
+    except Exception as exc:
+        raise http_error(500, f"Internal error during import: {str(exc)}")
 
 @management_router.get("/infrastructure")
 def get_infrastructure():

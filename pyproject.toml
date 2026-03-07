@@ -6,10 +6,23 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "aiida-core>=2.7.3",
-    "aiida-quantumespresso>=4.16.0",
     "fastapi>=0.133.0",
     "httpx>=0.28.1",
     "ipykernel>=7.2.0",
     "uvicorn>=0.41.0",
     "sse-starlette>=2.0.0",
+    "python-multipart>=0.0.12",
+    "ase>=3.23.0",
+    "pandas>=2.2.0",
+    "pyyaml>=6.0.1",
+]
+
+[project.optional-dependencies]
+quantumespresso = [
+    "aiida-quantumespresso>=4.16.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
 ]

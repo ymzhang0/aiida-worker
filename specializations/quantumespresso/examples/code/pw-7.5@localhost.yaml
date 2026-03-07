@@ -1,0 +1,9 @@
+append_text: ''
+computer: localhost
+default_calc_job_plugin: quantumespresso.pw
+description: Quantum ESPRESSO v7.5
+filepath_executable: /opt/homebrew/Caskroom/miniforge/base/envs/qe-7.5-intel/bin/pw.x
+label: pw-7.5
+prepend_text: conda activate qe-7.5-intel
+use_double_quotes: false
+with_mpi: true

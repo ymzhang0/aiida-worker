@@ -4,6 +4,7 @@ import inspect
 import json
 from typing import Any, Mapping, Sequence, get_args, get_origin
 
+from fastapi import HTTPException
 from aiida import orm
 from aiida.common.exceptions import MissingEntryPointError
 from aiida.engine import submit
@@ -88,8 +89,8 @@ def _resolve_node_reference(
     # Automatically map scalar ints/strings into AiiDA nodes if the port strictly expects a Node
     if _is_node_pk_candidate(port, value, allow_scalar_pk_resolution=allow_scalar_pk_resolution):
         try:
-            # Code nodes in AiiDA are often passed as labels like 'pw-7.5@localhost'
-            # which load_node doesn't natively parse without load_code handling.
+            # Code nodes are often referenced by "code@computer" labels, which need
+            # load_code handling instead of plain load_node resolution.
             valid_types = _extract_valid_types(port)
             expects_code = any(issubclass(t, orm.AbstractCode) for t in valid_types if isinstance(t, type))
             expects_group = any(issubclass(t, orm.Group) for t in valid_types if isinstance(t, type))
@@ -544,15 +545,34 @@ def _sanitize_overrides_for_spec(
     return sanitized, errors
 
 
-def _collect_required_port_paths(namespace: PortNamespace, prefix: Sequence[str] = ()) -> list[tuple[str, ...]]:
+def _collect_required_port_paths(
+    namespace: PortNamespace, 
+    payload: Mapping[str, Any], 
+    prefix: Sequence[str] = ()
+) -> list[tuple[str, ...]]:
     required: list[tuple[str, ...]] = []
+    
     for key, port in namespace.items():
         path = (*prefix, str(key))
-        if isinstance(port, PortNamespace):
-            required.extend(_collect_required_port_paths(port, path))
+        if path and path[0] == "metadata":
             continue
-        if bool(getattr(port, "required", False)):
-            required.append(path)
+            
+        port_present = key in payload and payload[key] is not None
+        
+        if isinstance(port, PortNamespace):
+            # If the namespace is required OR it is present in payload, check its children
+            is_required = bool(getattr(port, "required", False))
+            if is_required or port_present:
+                sub_payload = payload.get(key)
+                if not isinstance(sub_payload, Mapping):
+                    sub_payload = {}
+                required.extend(_collect_required_port_paths(port, sub_payload, path))
+        else:
+            # Atomic port
+            is_required = bool(getattr(port, "required", False))
+            if is_required:
+                required.append(path)
+                
     return required
 
 
@@ -567,12 +587,226 @@ def _path_exists(payload: Mapping[str, Any], path: Sequence[str]) -> bool:
 
 def _list_missing_required_ports(namespace: PortNamespace, payload: Mapping[str, Any]) -> list[str]:
     missing: list[str] = []
-    for path in _collect_required_port_paths(namespace):
-        if path and path[0] == "metadata":
-            continue
+    required_paths = _collect_required_port_paths(namespace, payload)
+    
+    for path in required_paths:
         if not _path_exists(payload, path):
             missing.append(".".join(path))
     return missing
+
+
+def _infer_resource_domain(*values: Any) -> str | None:
+    joined = " ".join(str(value or "") for value in values).strip().lower()
+    if not joined:
+        return None
+    if "entry point" in joined or "workflowfactory" in joined:
+        return "entry_point"
+    if "computer" in joined or "scheduler" in joined:
+        return "computer"
+    if "code" in joined:
+        return "code"
+    if "group" in joined:
+        return "group"
+    if "pseudo" in joined or "upf" in joined:
+        return "pseudo"
+    if "structure" in joined:
+        return "structure"
+    if "node" in joined or "pk=" in joined or "uuid" in joined:
+        return "node"
+    return None
+
+
+def _build_recovery_plan(
+    *,
+    entry_point: str,
+    errors: Sequence[Mapping[str, Any]],
+    missing_ports: Sequence[str],
+    required_ports: Sequence[str],
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    issue_keys: set[tuple[str, str, str]] = set()
+    resource_domains: set[str] = set()
+
+    def append_issue(
+        issue_type: str,
+        *,
+        message: str,
+        port: str | None = None,
+        stage: str | None = None,
+        resource_domain: str | None = None,
+    ) -> None:
+        normalized_message = str(message or "").strip()
+        if not normalized_message:
+            return
+        key = (issue_type, str(port or "").strip(), normalized_message)
+        if key in issue_keys:
+            return
+        issue_keys.add(key)
+        issue: dict[str, Any] = {
+            "type": issue_type,
+            "message": normalized_message,
+        }
+        if port:
+            issue["port"] = port
+        if stage:
+            issue["stage"] = stage
+        if resource_domain:
+            issue["resource_domain"] = resource_domain
+            resource_domains.add(resource_domain)
+        issues.append(issue)
+
+    if missing_ports:
+        preview = ", ".join(str(port) for port in missing_ports[:6])
+        if len(missing_ports) > 6:
+            preview += ", ..."
+        append_issue(
+            "missing_required_inputs",
+            message=f"Required inputs are still missing after builder construction: {preview}",
+            stage="missing_required_ports",
+        )
+
+    for error in errors:
+        stage = str(error.get("stage") or "").strip()
+        port = str(error.get("port") or "").strip() or None
+        message = str(error.get("message") or error.get("reason") or error).strip()
+        lowered = message.lower()
+        resource_domain = _infer_resource_domain(port, message)
+
+        if stage == "missing_protocol_argument":
+            append_issue("missing_protocol_argument", message=message, port=port, stage=stage, resource_domain=resource_domain)
+            continue
+        if stage in {"resolve_protocol_argument", "resolve_overrides"}:
+            issue_type = "resource_reference_unresolved" if "could not load" in lowered or "not found" in lowered else "input_resolution_error"
+            append_issue(issue_type, message=message, port=port, stage=stage, resource_domain=resource_domain)
+            continue
+        if stage == "unsupported_overrides":
+            append_issue("unsupported_override", message=message, port=port, stage=stage)
+            continue
+        if "missing entry point" in lowered or resource_domain == "entry_point":
+            append_issue("entry_point_unavailable", message=message, port=port, stage=stage or "load_workflow", resource_domain="entry_point")
+            continue
+        if "could not load" in lowered or "not found" in lowered or "does not exist" in lowered or "no such" in lowered:
+            append_issue("resource_reference_unresolved", message=message, port=port, stage=stage, resource_domain=resource_domain)
+            continue
+        if stage == "validate":
+            append_issue("validation_error", message=message, port=port, stage=stage, resource_domain=resource_domain)
+            continue
+        append_issue("builder_construction_error", message=message, port=port, stage=stage, resource_domain=resource_domain)
+
+    recommended_actions: list[dict[str, Any]] = []
+    seen_actions: set[str] = set()
+
+    def append_action(action: str, reason: str) -> None:
+        normalized_action = str(action or "").strip()
+        normalized_reason = str(reason or "").strip()
+        if not normalized_action or normalized_action in seen_actions:
+            return
+        seen_actions.add(normalized_action)
+        recommended_actions.append({"action": normalized_action, "reason": normalized_reason})
+
+    issue_types = {issue["type"] for issue in issues}
+    if issue_types & {
+        "missing_required_inputs",
+        "missing_protocol_argument",
+        "input_resolution_error",
+        "unsupported_override",
+        "validation_error",
+    }:
+        append_action(
+            "inspect_spec",
+            "Review the WorkChain spec and builder signature before changing inputs.",
+        )
+    if "entry_point_unavailable" in issue_types:
+        append_action(
+            "inspect_available_workchains",
+            "Confirm that the requested WorkChain entry point is installed in the current worker.",
+        )
+    if resource_domains & {"code", "computer"}:
+        append_action(
+            "inspect_resources",
+            "Check the active AiiDA profile for matching computers and codes before retrying.",
+        )
+    if resource_domains & {"group", "pseudo", "structure", "node"} or missing_ports:
+        append_action(
+            "inspect_database_inputs",
+            "Check whether the required nodes, groups, or data objects exist in the current profile.",
+        )
+    if issues:
+        append_action(
+            "ask_user",
+            "Do not substitute missing inputs or resources silently; confirm the user's preferred fix.",
+        )
+        append_action(
+            "stop_if_unresolved",
+            "If the required input or resource cannot be found, stop the submission path and report the blocker.",
+        )
+
+    summary_parts: list[str] = []
+    if missing_ports:
+        summary_parts.append(f"Missing required inputs: {', '.join(str(port) for port in missing_ports[:5])}")
+    elif "entry_point_unavailable" in issue_types:
+        summary_parts.append("The requested WorkChain is not available in the current worker.")
+    elif resource_domains:
+        summary_parts.append("One or more referenced AiiDA resources could not be resolved.")
+    elif issues:
+        summary_parts.append(str(issues[0].get("message") or "Builder validation failed."))
+    else:
+        summary_parts.append("Review builder diagnostics before retrying.")
+
+    if required_ports:
+        summary_parts.append(f"Required spec ports: {', '.join(str(port) for port in required_ports[:6])}")
+
+    return {
+        "status": "blocked" if issues else "ready",
+        "entry_point": entry_point,
+        "summary": " ".join(summary_parts),
+        "issues": issues,
+        "missing_ports": list(missing_ports),
+        "required_ports": list(required_ports),
+        "resource_domains": sorted(resource_domains),
+        "recommended_actions": recommended_actions,
+        "user_decision_required": bool(issues),
+    }
+
+
+def _failure_message_from_http_exception(exc: HTTPException) -> str:
+    detail = exc.detail
+    if isinstance(detail, Mapping):
+        return str(detail.get("reason") or detail.get("error") or detail.get("message") or exc)
+    return str(detail or exc)
+
+
+def _build_failed_protocol_builder_result(
+    *,
+    entry_point: str,
+    protocol: str | None,
+    intent_data: Mapping[str, Any],
+    overrides: Mapping[str, Any],
+    errors: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    normalized_errors = [dict(item) for item in errors]
+    recovery_plan = _build_recovery_plan(
+        entry_point=entry_point,
+        errors=normalized_errors,
+        missing_ports=[],
+        required_ports=[],
+    )
+    return {
+        "success": False,
+        "entry_point": entry_point,
+        "protocol": protocol,
+        "intent_data": to_jsonable(intent_data),
+        "overrides": to_jsonable(overrides),
+        "protocol_kwargs": {},
+        "signature": [],
+        "pseudo_expectations": [],
+        "required_ports": [],
+        "missing_ports": [],
+        "builder": None,
+        "builder_inputs": {},
+        "errors": normalized_errors,
+        "recovery_plan": recovery_plan,
+    }
 
 
 def _coerce_builder_argument(
@@ -660,11 +894,43 @@ def _inspect_builder_protocol_signature(workchain: Any) -> dict[str, inspect.Par
 
 def _build_dynamic_protocol_builder(draft_data: Mapping[str, Any]) -> dict[str, Any]:
     entry_point, protocol, intent_data, overrides = _extract_builder_request(draft_data)
-    workchain = _load_workflow(entry_point)
-    parameters = _inspect_builder_protocol_signature(workchain)
+    try:
+        workchain = _load_workflow(entry_point)
+    except HTTPException as exc:
+        return _build_failed_protocol_builder_result(
+            entry_point=entry_point,
+            protocol=protocol,
+            intent_data=intent_data,
+            overrides=overrides,
+            errors=[
+                {
+                    "stage": "load_workflow",
+                    "port": entry_point,
+                    "message": _failure_message_from_http_exception(exc),
+                }
+            ],
+        )
+
+    try:
+        parameters = _inspect_builder_protocol_signature(workchain)
+    except HTTPException as exc:
+        return _build_failed_protocol_builder_result(
+            entry_point=entry_point,
+            protocol=protocol,
+            intent_data=intent_data,
+            overrides=overrides,
+            errors=[
+                {
+                    "stage": "inspect_protocol_signature",
+                    "port": entry_point,
+                    "message": _failure_message_from_http_exception(exc),
+                }
+            ],
+        )
 
     spec_inputs = workchain.spec().inputs
     errors: list[dict[str, Any]] = []
+    required_ports = _list_missing_required_ports(spec_inputs, {})
 
     sanitized_overrides, override_errors = _sanitize_overrides_for_spec(spec_inputs, overrides)
     errors.extend(override_errors)
@@ -799,6 +1065,13 @@ def _build_dynamic_protocol_builder(draft_data: Mapping[str, Any]) -> dict[str, 
             }
         )
 
+    recovery_plan = _build_recovery_plan(
+        entry_point=entry_point,
+        errors=errors,
+        missing_ports=missing_ports,
+        required_ports=required_ports,
+    )
+
     return {
         "success": len(errors) == 0,
         "entry_point": entry_point,
@@ -808,11 +1081,12 @@ def _build_dynamic_protocol_builder(draft_data: Mapping[str, Any]) -> dict[str, 
         "protocol_kwargs": to_jsonable(kwargs),
         "signature": signature_payload,
         "pseudo_expectations": [],  # Generic WorkChains don't have QE specific hardcoding
-        "required_ports": _list_missing_required_ports(spec_inputs, {}),
+        "required_ports": required_ports,
         "missing_ports": missing_ports,
         "builder": builder,
         "builder_inputs": to_jsonable(builder_inputs),
         "errors": errors,
+        "recovery_plan": recovery_plan,
     }
 
 
@@ -831,6 +1105,7 @@ def _draft_workchain_builder(draft_data: Mapping[str, Any]) -> dict[str, Any]:
             "signature": result["signature"],
             "pseudo_expectations": result["pseudo_expectations"],
             "builder_inputs": result.get("builder_inputs", {}),
+            "recovery_plan": result["recovery_plan"],
         }
 
     return {
@@ -843,6 +1118,7 @@ def _draft_workchain_builder(draft_data: Mapping[str, Any]) -> dict[str, Any]:
         "signature": result["signature"],
         "pseudo_expectations": result["pseudo_expectations"],
         "builder_inputs": result.get("builder_inputs", {}),
+        "recovery_plan": result["recovery_plan"],
         "preview": f"Ready to submit {result['entry_point']} using protocol '{result['protocol']}'.",
     }
 
@@ -856,6 +1132,7 @@ def _submit_workchain_builder(draft_data: Mapping[str, Any]) -> dict[str, Any]:
             errors=result["errors"],
             missing_ports=result["missing_ports"],
             entry_point=result["entry_point"],
+            recovery_plan=result["recovery_plan"],
         )
 
     builder = result.get("builder")
@@ -889,6 +1166,7 @@ def _validate_workchain_builder(draft_data: Mapping[str, Any]) -> dict[str, Any]
             "signature": result["signature"],
             "pseudo_expectations": result["pseudo_expectations"],
             "builder_inputs": result.get("builder_inputs", {}),
+            "recovery_plan": result["recovery_plan"],
         }
 
     return {
@@ -899,6 +1177,7 @@ def _validate_workchain_builder(draft_data: Mapping[str, Any]) -> dict[str, Any]
         "signature": result["signature"],
         "pseudo_expectations": result["pseudo_expectations"],
         "builder_inputs": result.get("builder_inputs", {}),
+        "recovery_plan": result["recovery_plan"],
     }
 
 
@@ -1108,5 +1387,3 @@ def _submit_validated_workflow(entry_point: str, inputs: Mapping[str, Any] | Non
     process_state = getattr(node, "process_state", None)
     state = process_state.value if hasattr(process_state, "value") else str(process_state or "created")
     return {"pk": int(node.pk), "uuid": str(node.uuid), "state": state}
-
-

@@ -100,7 +100,17 @@ def submission_validate(payload: dict[str, Any]) -> ValidationResponse:
 
     if draft_payload is not None:
         result = _validate_workchain_builder(draft_payload)
-        return ValidationResponse(success=result["success"], message=result["message"], errors=result["errors"])
+        return ValidationResponse(
+            success=result["success"],
+            message=result["message"],
+            errors=result["errors"],
+            entry_point=result.get("entry_point"),
+            missing_ports=result.get("missing_ports", []),
+            signature=result.get("signature", []),
+            builder_inputs=result.get("builder_inputs", {}),
+            pseudo_expectations=result.get("pseudo_expectations", []),
+            recovery_plan=result.get("recovery_plan", {}),
+        )
 
     raise http_error(
         400,

@@ -1,0 +1,2 @@
+-r requirements.txt
+aiida-quantumespresso>=4.16.0

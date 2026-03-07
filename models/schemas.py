@@ -19,6 +19,12 @@ class ValidationResponse(BaseModel):
     success: bool
     message: str
     errors: list[dict[str, Any]] = Field(default_factory=list)
+    entry_point: str | None = None
+    missing_ports: list[str] = Field(default_factory=list)
+    signature: list[dict[str, Any]] = Field(default_factory=list)
+    builder_inputs: dict[str, Any] = Field(default_factory=dict)
+    pseudo_expectations: list[dict[str, Any]] = Field(default_factory=list)
+    recovery_plan: dict[str, Any] = Field(default_factory=dict)
 
 
 class JobValidationRequest(BaseModel):
@@ -96,6 +102,13 @@ class GroupAddNodesRequest(BaseModel):
 
 class NodeSoftDeleteRequest(BaseModel):
     deleted: bool = True
+
+
+class NodeScriptResponse(BaseModel):
+    pk: int
+    node_type: str
+    language: str = "python"
+    script: str
 
 
 class PythonScriptRequest(BaseModel):
@@ -182,6 +195,7 @@ class BuilderDraftResponse(BaseModel):
     builder_inputs: dict[str, Any] = Field(default_factory=dict)
     errors: list[dict[str, Any]] = Field(default_factory=list)
     missing_ports: list[str] = Field(default_factory=list)
+    recovery_plan: dict[str, Any] = Field(default_factory=dict)
     preview: str | None = None
 
 
@@ -190,6 +204,15 @@ class BuilderScriptResponse(BaseModel):
     protocol: str | None = None
     signature: list[dict[str, Any]] = Field(default_factory=list)
     script: str
+
+
+class ProcessCloneDraftResponse(BaseModel):
+    process_label: str
+    entry_point: str
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    recommended_inputs: dict[str, Any] = Field(default_factory=dict)
+    advanced_settings: dict[str, Any] = Field(default_factory=dict)
+    meta: dict[str, Any] = Field(default_factory=dict)
 
 class InfrastructureSetupRequest(BaseModel):
     # Computer fields

@@ -20,6 +20,12 @@ from core.engine import (
     script_path,
 )
 from core.utils import to_jsonable
+from repository.analysis.common_utils import (
+    activate_workspace_path,
+    capture_saved_artifacts,
+    persist_plot_artifacts,
+    save_artifact,
+)
 
 
 def load_script_metadata(script_name: str) -> dict[str, Any]:
@@ -137,7 +143,12 @@ def get_registered_script(script_name: str, *, include_content: bool = True) -> 
     return payload
 
 
-async def execute_registered_script(script_name: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
+async def execute_registered_script(
+    script_name: str,
+    params: Mapping[str, Any] | None = None,
+    *,
+    workspace_path: str | None = None,
+) -> dict[str, Any]:
     safe_name = normalize_script_name(script_name)
     target = script_path(safe_name)
     if not target.exists():
@@ -149,12 +160,19 @@ async def execute_registered_script(script_name: str, params: Mapping[str, Any] 
         raise http_error(500, "Failed to load script module", script_name=safe_name)
 
     module = importlib.util.module_from_spec(spec)
+    module.save_artifact = save_artifact
+    module.ACTIVE_WORKSPACE_PATH = workspace_path
     output_buffer = io.StringIO()
     parsed_params = dict(params or {})
 
     try:
         sys.modules[module_name] = module
-        with redirect_stdout(output_buffer), redirect_stderr(output_buffer):
+        with (
+            activate_workspace_path(workspace_path),
+            capture_saved_artifacts() as saved_artifacts,
+            redirect_stdout(output_buffer),
+            redirect_stderr(output_buffer),
+        ):
             spec.loader.exec_module(module)
             entrypoint = getattr(module, "main", None)
             if not callable(entrypoint):
@@ -164,6 +182,10 @@ async def execute_registered_script(script_name: str, params: Mapping[str, Any] 
                 result = await entrypoint(parsed_params)
             else:
                 result = entrypoint(parsed_params)
+            if not saved_artifacts:
+                namespace = dict(module.__dict__)
+                namespace["__result__"] = result
+                persist_plot_artifacts(namespace, prefix=f"{safe_name}-auto")
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -171,6 +193,7 @@ async def execute_registered_script(script_name: str, params: Mapping[str, Any] 
             "success": False,
             "script_name": safe_name,
             "output": output_buffer.getvalue(),
+            "workspace_path": workspace_path,
             "error": traceback.format_exc(),
             "reason": str(exc),
         }
@@ -182,4 +205,6 @@ async def execute_registered_script(script_name: str, params: Mapping[str, Any] 
         "script_name": safe_name,
         "result": to_jsonable(result),
         "output": output_buffer.getvalue() or "",
+        "workspace_path": workspace_path,
+        "artifacts": saved_artifacts,
     }
