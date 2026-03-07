@@ -8,6 +8,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+import yaml
 from fastapi import HTTPException, Query, UploadFile, File, Form, Depends
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
@@ -48,6 +49,7 @@ from models.schemas import (
     GroupCreateRequest,
     GroupRenameRequest,
     InfrastructureSetupRequest,
+    InfrastructureExportResponse,
     NodeScriptResponse,
     NodeSoftDeleteRequest,
     ProfileSetupRequest,
@@ -66,7 +68,7 @@ plugins_router = SessionCleanupAPIRouter(tags=["plugins"])
 _RECENT_NODES_CACHE_TTL_SECONDS = max(0.5, float(os.getenv("AIIDA_RECENT_NODES_CACHE_TTL_SECONDS", "5.0")))
 _RECENT_NODES_CACHE_MAX_ITEMS = max(10, int(os.getenv("AIIDA_RECENT_NODES_CACHE_MAX_ITEMS", "128")))
 _RECENT_NODES_CACHE_LOCK = threading.Lock()
-_RECENT_NODES_CACHE: dict[tuple[int, str | None, str | None, str | None, str | None], tuple[float, list[dict[str, Any]]]] = {}
+_RECENT_NODES_CACHE: dict[tuple[int, str | None, str | None, str | None, str | None, bool], tuple[float, list[dict[str, Any]]]] = {}
 _SOFT_DELETED_EXTRA_KEY = "sabr_soft_deleted"
 _SOFT_DELETED_AT_EXTRA_KEY = "sabr_soft_deleted_at"
 
@@ -235,21 +237,18 @@ def _inspect_group(group_name: str, limit: int = 20) -> dict[str, Any]:
     }
 
 
-def _get_recent_processes(limit: int = 15) -> list[dict[str, Any]]:
+def _get_recent_processes(limit: int = 15, *, root_only: bool = True) -> list[dict[str, Any]]:
     qb = QueryBuilder()
     qb.append(
         ProcessNode,
         project=[
-            "id",
-            "attributes.process_state",
-            "attributes.process_label",
-            "attributes.exit_status",
-            "ctime",
+            "*",
         ],
         tag="process",
+        subclassing=True,
     )
     qb.order_by({"process": {"ctime": "desc"}})
-    qb.limit(max(1, int(limit)))
+    qb.limit(max(1, int(limit)) * 6)
 
     try:
         with db_access_guard("recent-processes"):
@@ -260,18 +259,23 @@ def _get_recent_processes(limit: int = 15) -> list[dict[str, Any]]:
         raise http_error(503, "Database temporarily unavailable", endpoint="recent-processes", reason=str(exc)) from exc
 
     results: list[dict[str, Any]] = []
-    for pk, state, label, exit_status, ctime in rows:
+    for (node,) in rows:
+        if root_only and getattr(node, "caller", None) is not None:
+            continue
+        state = getattr(node, "process_state", None)
         state_value = state.value if hasattr(state, "value") else str(state or "unknown")
         results.append(
             {
-                "pk": int(pk),
-                "label": str(label or "Unknown Task"),
-                "process_label": str(label or "Unknown Task"),
+                "pk": int(node.pk),
+                "label": str(getattr(node, "process_label", None) or node.label or "Unknown Task"),
+                "process_label": str(getattr(node, "process_label", None) or node.label or "Unknown Task"),
                 "state": state_value,
-                "exit_status": exit_status,
-                "ctime": ctime.strftime("%Y-%m-%d %H:%M:%S") if ctime else None,
+                "exit_status": getattr(node, "exit_status", None),
+                "ctime": node.ctime.strftime("%Y-%m-%d %H:%M:%S") if getattr(node, "ctime", None) else None,
             }
         )
+        if len(results) >= max(1, int(limit)):
+            break
     return results
 
 
@@ -280,7 +284,7 @@ def _clone_recent_nodes_payload(items: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def _get_recent_nodes_cached(
-    key: tuple[int, str | None, str | None, str | None, str | None],
+    key: tuple[int, str | None, str | None, str | None, str | None, bool],
     *,
     allow_stale: bool = False,
 ) -> list[dict[str, Any]] | None:
@@ -295,7 +299,7 @@ def _get_recent_nodes_cached(
     return _clone_recent_nodes_payload(payload)
 
 
-def _set_recent_nodes_cached(key: tuple[int, str | None, str | None, str | None, str | None], payload: list[dict[str, Any]]) -> None:
+def _set_recent_nodes_cached(key: tuple[int, str | None, str | None, str | None, str | None, bool], payload: list[dict[str, Any]]) -> None:
     with _RECENT_NODES_CACHE_LOCK:
         if len(_RECENT_NODES_CACHE) >= _RECENT_NODES_CACHE_MAX_ITEMS:
             oldest_key = min(_RECENT_NODES_CACHE.items(), key=lambda item: item[1][0])[0]
@@ -480,6 +484,7 @@ def _get_recent_nodes(
     node_type: str | None = None,
     label: str | None = None,
     process_state: str | None = None,
+    root_only: bool = True,
 ) -> list[dict[str, Any]]:
     normalized_limit = max(1, int(limit))
     normalized_group = str(group_label).strip() if group_label and str(group_label).strip() else None
@@ -493,6 +498,7 @@ def _get_recent_nodes(
         normalized_node_type,
         normalized_label,
         normalized_process_state,
+        bool(root_only),
     )
 
     cached_payload = _get_recent_nodes_cached(cache_key)
@@ -519,7 +525,6 @@ def _get_recent_nodes(
             node_filters["label"] = {"ilike": f"%{normalized_label}%"}
     if normalized_process_state:
         node_filters["attributes.process_state"] = normalized_process_state
-    
     if node_filters:
         qb.add_filter("node", node_filters)
 
@@ -548,6 +553,8 @@ def _get_recent_nodes(
     results: list[dict[str, Any]] = []
     for (node,) in rows:
         if _is_soft_deleted(node):
+            continue
+        if root_only and isinstance(node, ProcessNode) and getattr(node, "caller", None) is not None:
             continue
         process_state_value: str | None = None
         if isinstance(node, ProcessNode):
@@ -675,6 +682,35 @@ def _get_remote_file_content(pk: int | str, filename: str) -> dict[str, Any]:
         "pk": int(node.pk),
         "filename": target,
         "content": content,
+    }
+
+
+def _list_repository_files(pk: int | str, source: str = "folder") -> dict[str, Any]:
+    try:
+        node = orm.load_node(pk)
+    except Exception as exc:  # noqa: BLE001
+        raise http_error(404, "Node not found", pk=str(pk), reason=str(exc)) from exc
+
+    mode = str(source or "folder").strip().lower()
+
+    try:
+        if mode in {"repository", "virtual.repository"}:
+            files = node.base.repository.list_object_names()
+        else:
+            files = node.list_object_names()
+    except Exception as exc:  # noqa: BLE001
+        raise http_error(
+            500,
+            "Failed to list node files",
+            pk=str(pk),
+            source=source,
+            reason=str(exc),
+        ) from exc
+
+    return {
+        "pk": int(node.pk),
+        "source": mode,
+        "files": to_jsonable(sorted([str(entry) for entry in files])),
     }
 
 
@@ -904,9 +940,12 @@ def management_inspect_group(group_name: str, limit: int = Query(default=20, ge=
 
 
 @management_router.get("/recent-processes")
-def management_recent_processes(limit: int = Query(default=15, ge=1, le=200)) -> dict[str, Any]:
+def management_recent_processes(
+    limit: int = Query(default=15, ge=1, le=200),
+    root_only: bool = Query(default=True),
+) -> dict[str, Any]:
     ensure_profile_loaded()
-    return {"items": _get_recent_processes(limit)}
+    return {"items": _get_recent_processes(limit, root_only=root_only)}
 
 
 @management_router.get("/recent-nodes")
@@ -916,6 +955,7 @@ def management_recent_nodes(
     node_type: str | None = Query(default=None),
     label: str | None = Query(default=None),
     process_state: str | None = Query(default=None),
+    root_only: bool = Query(default=True),
 ) -> dict[str, Any]:
     ensure_profile_loaded()
     return {"items": _get_recent_nodes(
@@ -924,6 +964,7 @@ def management_recent_nodes(
         node_type=node_type,
         label=label,
         process_state=process_state,
+        root_only=root_only,
     )}
 
 
@@ -986,6 +1027,12 @@ def data_remote_files(pk: int) -> dict[str, Any]:
 def data_remote_file_content(pk: int, filename: str) -> dict[str, Any]:
     ensure_profile_loaded()
     return _get_remote_file_content(pk, filename)
+
+
+@data_router.get("/repository/{pk}/files")
+def data_repository_files(pk: int, source: str = Query(default="folder")) -> dict[str, Any]:
+    ensure_profile_loaded()
+    return _list_repository_files(pk, source=source)
 
 
 @data_router.get("/repository/{pk}/files/{filename:path}")
@@ -1218,6 +1265,134 @@ def get_computer_codes(computer_label: str):
     except Exception as exc:
         raise http_error(500, "Failed to fetch computer codes", reason=str(exc))
 
+
+def _trim_export_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, nested_value in value.items():
+            trimmed = _trim_export_value(nested_value)
+            if trimmed is None:
+                continue
+            if isinstance(trimmed, str) and not trimmed:
+                continue
+            if isinstance(trimmed, dict) and not trimmed:
+                continue
+            cleaned[str(key)] = trimmed
+        return cleaned
+    if isinstance(value, list):
+        return [_trim_export_value(item) for item in value]
+    if value is None:
+        return None
+    return value
+
+
+def _dump_export_yaml(payload: dict[str, Any]) -> str:
+    return yaml.safe_dump(
+        _trim_export_value(payload),
+        sort_keys=False,
+        allow_unicode=False,
+        default_flow_style=False,
+    )
+
+
+def _build_computer_export_response(computer: Any) -> InfrastructureExportResponse:
+    exported: dict[str, Any] = {
+        "label": str(computer.label),
+        "hostname": str(computer.hostname),
+        "description": str(computer.description) if computer.description else None,
+        "transport": str(computer.transport_type),
+        "scheduler": str(computer.scheduler_type),
+        "shebang": str(getattr(computer, "get_shebang", lambda: "")() or ""),
+        "work_dir": str(getattr(computer, "get_workdir", lambda: "")() or ""),
+        "mpiprocs_per_machine": getattr(computer, "get_default_mpiprocs_per_machine", lambda: None)(),
+        "mpirun_command": " ".join(getattr(computer, "get_mpirun_command", lambda: [])() or []),
+        "default_memory_per_machine": getattr(computer, "get_default_memory_per_machine", lambda: None)(),
+        "prepend_text": str(computer.get_prepend_text()) if hasattr(computer, "get_prepend_text") else None,
+        "append_text": str(computer.get_append_text()) if hasattr(computer, "get_append_text") else None,
+        "use_double_quotes": bool(getattr(computer, "get_use_double_quotes", lambda: False)()),
+    }
+
+    with suppress(Exception):
+        user = orm.User.collection.get_default()
+        authinfo = computer.get_authinfo(user)
+        auth_params = authinfo.get_auth_params() if hasattr(authinfo, "get_auth_params") else {}
+        if isinstance(auth_params, dict) and auth_params:
+            exported["auth"] = {
+                "username": auth_params.get("username"),
+                "key_filename": auth_params.get("key_filename"),
+                "proxy_command": auth_params.get("proxy_command"),
+                "proxy_jump": auth_params.get("proxy_jump"),
+                "use_login_shell": auth_params.get("use_login_shell"),
+                "safe_interval": auth_params.get("safe_interval"),
+                "connection_timeout": auth_params.get("connection_timeout"),
+            }
+
+    return InfrastructureExportResponse(
+        kind="computer",
+        label=str(computer.label),
+        filename=f"{computer.label}-setup.yaml",
+        content=_dump_export_yaml(exported),
+    )
+
+
+@management_router.get(
+    "/infrastructure/computer/{computer_label}/export",
+    response_model=InfrastructureExportResponse,
+)
+def export_computer_config(computer_label: str):
+    ensure_profile_loaded()
+    try:
+        computer = orm.Computer.collection.get(label=computer_label)
+        return _build_computer_export_response(computer)
+    except Exception as exc:
+        raise http_error(500, "Failed to export computer config", reason=str(exc))
+
+
+@management_router.get(
+    "/infrastructure/computer/pk/{computer_pk}/export",
+    response_model=InfrastructureExportResponse,
+)
+def export_computer_config_by_pk(computer_pk: int):
+    ensure_profile_loaded()
+    try:
+        computer = orm.Computer.collection.get(pk=computer_pk)
+        return _build_computer_export_response(computer)
+    except Exception as exc:
+        raise http_error(500, "Failed to export computer config", reason=str(exc))
+
+
+@management_router.get(
+    "/infrastructure/code/{code_pk}/export",
+    response_model=InfrastructureExportResponse,
+)
+def export_code_config(code_pk: int):
+    ensure_profile_loaded()
+    try:
+        code = orm.load_code(code_pk)
+        exported = {
+            "label": str(code.label),
+            "computer": str(code.computer.label) if getattr(code, "computer", None) else None,
+            "description": str(code.description) if code.description else None,
+            "default_calc_job_plugin": str(getattr(code, "default_calc_job_plugin", "") or ""),
+            "filepath_executable": str(getattr(code, "filepath_executable", "") or ""),
+            "prepend_text": str(code.get_prepend_text()) if hasattr(code, "get_prepend_text") else None,
+            "append_text": str(code.get_append_text()) if hasattr(code, "get_append_text") else None,
+            "with_mpi": bool(getattr(code, "with_mpi", False)),
+            "use_double_quotes": bool(getattr(code, "use_double_quotes", False)),
+        }
+        filename_label = str(code.label)
+        computer_label = str(code.computer.label) if getattr(code, "computer", None) else None
+        if computer_label:
+            filename_label = f"{filename_label}@{computer_label}"
+        return InfrastructureExportResponse(
+            kind="code",
+            label=str(code.label),
+            filename=f"{filename_label}.yaml",
+            content=_dump_export_yaml(exported),
+        )
+    except Exception as exc:
+        raise http_error(500, "Failed to export code config", reason=str(exc))
+
 @management_router.post("/infrastructure/setup")
 def setup_infrastructure(payload: InfrastructureSetupRequest):
     """
@@ -1241,6 +1416,11 @@ def setup_infrastructure(payload: InfrastructureSetupRequest):
         computer.set_default_mpiprocs_per_machine(payload.mpiprocs_per_machine)
         if payload.mpirun_command:
             computer.set_mpirun_command(payload.mpirun_command.split())
+        if payload.shebang:
+            computer.set_shebang(payload.shebang)
+        if payload.default_memory_per_machine is not None:
+            computer.set_default_memory_per_machine(payload.default_memory_per_machine)
+        computer.set_use_double_quotes(payload.use_double_quotes)
         if payload.prepend_text:
             computer.set_prepend_text(payload.prepend_text)
         if payload.append_text:

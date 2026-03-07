@@ -135,7 +135,7 @@ def submission_validate_job(payload: JobValidationRequest) -> JobValidationRespo
 
 
 @submission_router.post("/submit", response_model=SubmitResponse | ValidationResponse)
-def submission_submit(payload: dict[str, Any]) -> Any:
+async def submission_submit(payload: dict[str, Any]) -> Any:
     """
     Unified submission endpoint.
     Supports either:
@@ -192,7 +192,7 @@ def submission_draft_builder(payload: BuilderDraftRequest) -> Any:
 
 
 @submission_router.post("/submit-builder", response_model=SubmitResponse)
-def submission_submit_builder(payload: BuilderSubmitRequest) -> Any:
+async def submission_submit_builder(payload: BuilderSubmitRequest) -> Any:
     ensure_profile_loaded()
     return _submit_workchain_builder(payload.draft)
 

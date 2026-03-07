@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from contextlib import suppress
 from datetime import datetime
 from pprint import pformat
-from typing import Any
+from typing import Any, Mapping
 
 from aiida import orm
 
@@ -287,7 +288,11 @@ class RemoteDataSerializer:
         remote_path: str | None = None
         with suppress(Exception):
             remote_path = str(node.get_remote_path())
-        return {"computer": computer_label or None, "path": shorten_path_for_preview(remote_path)}
+        return {
+            "computer": computer_label or None,
+            "path": shorten_path_for_preview(remote_path),
+            "remote_path": remote_path,
+        }
     def extract_payload(self, node: orm.RemoteData) -> Any:
         return None
 
@@ -371,6 +376,23 @@ class XyDataSerializer:
 
 class KpointsDataSerializer:
     def build_preview(self, node: orm.KpointsData) -> dict[str, Any] | None:
+        with suppress(Exception):
+            mesh, offset = node.get_kpoints_mesh()
+            return {
+                "mode": "mesh",
+                "mesh": to_jsonable(mesh),
+                "offset": to_jsonable(offset),
+            }
+
+        with suppress(Exception):
+            kpoints = node.get_kpoints()
+            labels = getattr(node, "labels", None)
+            return {
+                "mode": "list",
+                "num_points": int(len(kpoints)),
+                "has_labels": bool(labels),
+            }
+
         return None
     def extract_payload(self, node: orm.KpointsData) -> Any:
         try:
@@ -423,6 +445,64 @@ def build_node_preview(node: orm.Node) -> dict[str, Any] | None:
     if serializer:
         return serializer.build_preview(node)
     return None
+
+
+def _iterate_node_manager(manager: Any) -> list[tuple[str, Any]]:
+    entries: list[tuple[str, Any]] = []
+    if hasattr(manager, "_get_keys") and hasattr(manager, "_get_node_by_link_label"):
+        try:
+            for key in manager._get_keys():
+                entries.append((str(key), manager._get_node_by_link_label(key)))
+            return entries
+        except Exception:
+            entries = []
+
+    try:
+        keys = manager.keys()
+    except Exception:
+        return entries
+
+    for key in keys:
+        key_text = str(key).strip()
+        if not key_text:
+            continue
+        try:
+            entries.append((key_text, manager[key]))
+        except Exception:
+            continue
+    return entries
+
+
+def _flatten_node_manager(manager: Any, prefix: str = "") -> dict[str, orm.Node]:
+    result: dict[str, orm.Node] = {}
+    for key, value in _iterate_node_manager(manager):
+        if isinstance(value, orm.Node):
+            result[f"{prefix}{key}"] = value
+            continue
+        if hasattr(value, "_get_keys") or (
+            hasattr(value, "keys") and not isinstance(value, Mapping)
+        ):
+            result.update(_flatten_node_manager(value, prefix=f"{prefix}{key}__"))
+    return result
+
+
+def serialize_direct_links(node: orm.Node, mode: str = "incoming") -> dict[str, Any]:
+    manager = getattr(node, "inputs" if mode == "incoming" else "outputs", None)
+    if manager is None:
+        return {}
+
+    links: dict[str, Any] = {}
+    counts: defaultdict[str, int] = defaultdict(int)
+    for link_label, linked_node in _flatten_node_manager(manager).items():
+        unique_label = f"{link_label}_{counts[link_label]}" if counts[link_label] > 0 else link_label
+        counts[link_label] += 1
+
+        preview = serialize_node(linked_node)
+        preview["link_label"] = link_label
+        preview["pk"] = int(preview["pk"])
+        links[unique_label] = preview
+
+    return links
 
 
 def serialize_links(node: orm.Node, mode: str = "incoming") -> dict[str, Any]:
@@ -518,17 +598,9 @@ def get_node_summary(node_pk: int) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         raise http_error(404, "Node not found", pk=node_pk, reason=str(exc)) from exc
 
-    try:
-        incoming_count = len(node.base.links.get_incoming().all())
-    except Exception:  # noqa: BLE001
-        incoming_count = 0
-
-    try:
-        outgoing_count = len(node.base.links.get_outgoing().all())
-    except Exception:  # noqa: BLE001
-        outgoing_count = 0
-
     info = serialize_node(node)
+    direct_inputs = serialize_direct_links(node, mode="incoming")
+    direct_outputs = serialize_direct_links(node, mode="outgoing")
     
     # ProcessNode specific fields might already be populated by serialize_node,
     # but get_node_summary explicitly returns them even if empty or defaults
@@ -539,15 +611,15 @@ def get_node_summary(node_pk: int) -> dict[str, Any]:
     if "exit_status" not in info:
         info["exit_status"] = "N/A"
 
-    info["incoming"] = incoming_count
-    info["outgoing"] = outgoing_count
+    info["incoming"] = len(direct_inputs)
+    info["outgoing"] = len(direct_outputs)
     info["attributes"] = to_jsonable(node.base.attributes.all)
     
-    # Detailed links for the preview drawer
-    info["inputs"] = serialize_links(node, mode="incoming")
-    info["outputs"] = serialize_links(node, mode="outgoing")
-    info["direct_inputs"] = info["inputs"]
-    info["direct_outputs"] = info["outputs"]
+    # Inspector links should reflect only the node's direct input/output port mappings.
+    info["inputs"] = direct_inputs
+    info["outputs"] = direct_outputs
+    info["direct_inputs"] = direct_inputs
+    info["direct_outputs"] = direct_outputs
 
     # Remove payload from summary for lightweight response
     info.pop("payload", None)

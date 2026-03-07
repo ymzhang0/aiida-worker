@@ -407,10 +407,12 @@ class ProcessTree:
 
     def to_dict(self) -> dict[str, Any]:
         summary = _get_process_summary(self.node)
-        summary["inputs"] = _get_links_dict(self.node, "incoming")
-        summary["outputs"] = _get_links_dict(self.node, "outgoing")
-        summary["direct_inputs"] = _get_direct_links_dict(self.node, "incoming")
-        summary["direct_outputs"] = _get_direct_links_dict(self.node, "outgoing")
+        direct_inputs = _get_direct_links_dict(self.node, "incoming")
+        direct_outputs = _get_direct_links_dict(self.node, "outgoing")
+        summary["inputs"] = direct_inputs
+        summary["outputs"] = direct_outputs
+        summary["direct_inputs"] = direct_inputs
+        summary["direct_outputs"] = direct_outputs
         summary["children"] = {label: child.to_dict() for label, child in self.children.items()}
         return summary
 

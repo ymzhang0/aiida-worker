@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import subprocess
+import sys
 from typing import Any, Mapping, Sequence, get_args, get_origin
 
 from fastapi import HTTPException
@@ -11,7 +13,7 @@ from aiida.engine import submit
 from aiida.engine.processes.ports import InputPort, PortNamespace
 from aiida.plugins import WorkflowFactory
 
-from core.engine import http_error
+from core.engine import active_profile_name, http_error
 from core.utils import serialize_spec, to_jsonable, type_to_string
 
 
@@ -27,6 +29,78 @@ _RESERVED_BUILDER_KEYS = {
     "structure_pk",
     "code",
 }
+
+
+def _serialize_builder_code_input(code: Any) -> str:
+    for attr_name in ("full_label",):
+        value = getattr(code, attr_name, None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    label = str(getattr(code, "label", "") or "").strip()
+    computer = getattr(code, "computer", None)
+    computer_label = str(getattr(computer, "label", "") or "").strip() if computer is not None else ""
+    if label and computer_label:
+        return f"{label}@{computer_label}"
+    if label:
+        return label
+    return str(getattr(code, "pk", "") or "").strip()
+
+
+def _serialize_builder_node_value(node: orm.Node) -> Any:
+    if isinstance(node, orm.Dict):
+        try:
+            return to_jsonable(node.get_dict())
+        except Exception:  # noqa: BLE001
+            return {}
+    if isinstance(node, orm.List):
+        try:
+            return to_jsonable(node.get_list())
+        except Exception:  # noqa: BLE001
+            return []
+    if isinstance(node, orm.Int):
+        return int(node.value)
+    if isinstance(node, orm.Float):
+        return float(node.value)
+    if isinstance(node, orm.Bool):
+        return bool(node.value)
+    if isinstance(node, orm.Str):
+        return str(node.value)
+
+    abstract_code = getattr(orm, "AbstractCode", None)
+    if isinstance(abstract_code, type) and isinstance(node, abstract_code):
+        return _serialize_builder_code_input(node)
+    if isinstance(node, orm.Code):
+        return _serialize_builder_code_input(node)
+
+    raw_pk = getattr(node, "pk", None)
+    pk_value = int(raw_pk) if isinstance(raw_pk, int) else None
+    label = str(getattr(node, "label", "") or "").strip()
+    return {
+        "pk": pk_value,
+        "uuid": str(getattr(node, "uuid", "") or ""),
+        "type": node.__class__.__name__,
+        "label": label,
+    }
+
+
+def _serialize_builder_inputs_payload(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, orm.Node):
+        return _serialize_builder_node_value(value)
+
+    if value.__class__.__name__.startswith("ProcessBuilderNamespace"):
+        return {str(key): _serialize_builder_inputs_payload(item) for key, item in value.items()}
+
+    if isinstance(value, Mapping):
+        return {str(key): _serialize_builder_inputs_payload(item) for key, item in value.items()}
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_serialize_builder_inputs_payload(item) for item in value]
+
+    return to_jsonable(value)
 
 
 def _extract_valid_types(port: InputPort | PortNamespace) -> tuple[type[Any], ...]:
@@ -1084,7 +1158,7 @@ def _build_dynamic_protocol_builder(draft_data: Mapping[str, Any]) -> dict[str, 
         "required_ports": required_ports,
         "missing_ports": missing_ports,
         "builder": builder,
-        "builder_inputs": to_jsonable(builder_inputs),
+        "builder_inputs": _serialize_builder_inputs_payload(builder_inputs),
         "errors": errors,
         "recovery_plan": recovery_plan,
     }
@@ -1135,22 +1209,20 @@ def _submit_workchain_builder(draft_data: Mapping[str, Any]) -> dict[str, Any]:
             recovery_plan=result["recovery_plan"],
         )
 
-    builder = result.get("builder")
-    if builder is None:
-        raise http_error(500, "Builder construction failed unexpectedly", entry_point=result["entry_point"])
-
-    try:
-        node = submit(builder)
-    except Exception as exc:  # noqa: BLE001
-        raise http_error(500, "WorkChain submission failed", reason=str(exc)) from exc
-
-    process_state = getattr(node, "process_state", None)
-    state = process_state.value if hasattr(process_state, "value") else str(process_state or "created")
+    entry_point, protocol, intent_data, overrides = _extract_builder_request(draft_data)
+    script = _render_dynamic_submission_script(
+        entry_point=entry_point,
+        profile_name=active_profile_name(),
+        protocol=protocol,
+        intent_data=intent_data,
+        overrides=overrides,
+    )
+    payload = _run_submission_script(script, entry_point=entry_point)
     return {
         "status": "submitted",
-        "pk": int(node.pk),
-        "uuid": str(node.uuid),
-        "state": state,
+        "pk": int(payload.get("pk") or 0),
+        "uuid": str(payload.get("uuid") or ""),
+        "state": "created",
     }
 
 
@@ -1184,30 +1256,36 @@ def _validate_workchain_builder(draft_data: Mapping[str, Any]) -> dict[str, Any]
 def _render_dynamic_submission_script(
     *,
     entry_point: str,
+    profile_name: str,
     protocol: str | None,
     intent_data: Mapping[str, Any],
     overrides: Mapping[str, Any],
 ) -> str:
-    entry_json = json.dumps(entry_point)
-    protocol_json = json.dumps(protocol)
-    intent_json = json.dumps(to_jsonable(dict(intent_data)), indent=2, ensure_ascii=True)
-    overrides_json = json.dumps(to_jsonable(dict(overrides)), indent=2, ensure_ascii=True)
+    profile_json = repr(profile_name)
+    entry_json = repr(entry_point)
+    protocol_json = repr(protocol)
+    intent_json = repr(to_jsonable(dict(intent_data)))
+    overrides_json = repr(to_jsonable(dict(overrides)))
 
     return (
         "from __future__ import annotations\n"
         "\n"
         "import inspect\n"
+        "import json\n"
         "from typing import Any, Mapping\n"
         "\n"
-        "from aiida import orm\n"
+        "from aiida import load_profile, orm\n"
         "from aiida.engine import submit\n"
         "from aiida.plugins import WorkflowFactory\n"
         "\n"
+        f"PROFILE_NAME = {profile_json}\n"
         f"ENTRY_POINT = {entry_json}\n"
         f"PROTOCOL = {protocol_json}\n"
         f"INTENT_DATA = {intent_json}\n"
         f"OVERRIDES = {overrides_json}\n"
         "\n"
+        "\n"
+        "load_profile(PROFILE_NAME)\n"
         "\n"
         "def _normalize_key(value: str) -> str:\n"
         "    return ''.join(ch for ch in str(value).lower() if ch.isalnum())\n"
@@ -1276,26 +1354,6 @@ def _render_dynamic_submission_script(
         "    return value\n"
         "\n"
         "\n"
-        "def _collect_required_ports(namespace, prefix=()):\n"
-        "    required = []\n"
-        "    for key, port in namespace.items():\n"
-        "        path = (*prefix, str(key))\n"
-        "        if hasattr(port, 'items'):\n"
-        "            required.extend(_collect_required_ports(port, path))\n"
-        "        elif getattr(port, 'required', False) and (not path or path[0] != 'metadata'):\n"
-        "            required.append(path)\n"
-        "    return required\n"
-        "\n"
-        "\n"
-        "def _path_exists(payload: Mapping[str, Any], path: tuple[str, ...]) -> bool:\n"
-        "    current: Any = payload\n"
-        "    for key in path:\n"
-        "        if not isinstance(current, Mapping) or key not in current:\n"
-        "            return False\n"
-        "        current = current[key]\n"
-        "    return current is not None\n"
-        "\n"
-        "\n"
         "wc_class = WorkflowFactory(ENTRY_POINT)\n"
         "spec_inputs = wc_class.spec().inputs\n"
         "signature = inspect.signature(wc_class.get_builder_from_protocol)\n"
@@ -1323,17 +1381,8 @@ def _render_dynamic_submission_script(
         "    kwargs[name] = _coerce_argument(name, raw, port=port)\n"
         "\n"
         "builder = wc_class.get_builder_from_protocol(**kwargs)\n"
-        "builder_inputs = builder._inputs(prune=True)\n"
-        "missing = [\n"
-        "    '.'.join(path)\n"
-        "    for path in _collect_required_ports(spec_inputs)\n"
-        "    if not _path_exists(builder_inputs, path)\n"
-        "]\n"
-        "if missing:\n"
-        "    raise ValueError(f'Missing required ports after builder construction: {missing}')\n"
-        "\n"
         "node = submit(builder)\n"
-        "print({'pk': int(node.pk), 'uuid': str(node.uuid)})\n"
+        "print(json.dumps({'pk': int(node.pk), 'uuid': str(node.uuid)}))\n"
     )
 
 
@@ -1355,11 +1404,63 @@ def _generate_submission_script(draft_data: Mapping[str, Any]) -> dict[str, Any]
         ],
         "script": _render_dynamic_submission_script(
             entry_point=entry_point,
+            profile_name=active_profile_name(),
             protocol=protocol,
             intent_data=intent_data,
             overrides=overrides,
         ),
     }
+
+
+def _run_submission_script(script: str, *, entry_point: str) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise http_error(500, "WorkChain submission failed", entry_point=entry_point, reason=str(exc)) from exc
+
+    stdout = str(completed.stdout or "").strip()
+    stderr = str(completed.stderr or "").strip()
+    if completed.returncode != 0:
+        raise http_error(
+            500,
+            "WorkChain submission failed",
+            entry_point=entry_point,
+            reason=stderr or stdout or f"Submission helper exited with status {completed.returncode}",
+        )
+
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if not lines:
+        raise http_error(
+            500,
+            "WorkChain submission failed",
+            entry_point=entry_point,
+            reason="Submission helper produced no output",
+        )
+
+    try:
+        payload = json.loads(lines[-1])
+    except json.JSONDecodeError as exc:
+        raise http_error(
+            500,
+            "WorkChain submission failed",
+            entry_point=entry_point,
+            reason=f"Submission helper returned invalid JSON: {lines[-1][:220]}",
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise http_error(
+            500,
+            "WorkChain submission failed",
+            entry_point=entry_point,
+            reason="Submission helper did not return a JSON object",
+        )
+
+    return payload
 
 
 def _submit_validated_workflow(entry_point: str, inputs: Mapping[str, Any] | None = None) -> dict[str, Any]:

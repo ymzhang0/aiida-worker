@@ -221,9 +221,12 @@ class InfrastructureSetupRequest(BaseModel):
     computer_description: str | None = None
     transport_type: str = "core.ssh"
     scheduler_type: str = "core.direct"
+    shebang: str = "#!/bin/bash"
     work_dir: str = "/tmp/aiida"
     mpiprocs_per_machine: int = 1
     mpirun_command: str = "mpirun -np {tot_num_mpiprocs}"
+    default_memory_per_machine: int | None = None
+    use_double_quotes: bool = False
     prepend_text: str | None = None
     append_text: str | None = None
     
@@ -292,3 +295,11 @@ class CodeDetailedResponse(BaseModel):
     append_text: str | None = None
     with_mpi: bool
     use_double_quotes: bool
+
+
+class InfrastructureExportResponse(BaseModel):
+    kind: str
+    label: str
+    filename: str
+    format: str = "yaml"
+    content: str
