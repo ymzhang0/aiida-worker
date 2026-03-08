@@ -9,8 +9,5 @@
 		{
 			"path": "../.codex"
 		}
-	],
-	"settings": {
-		"codex.workspaceAlias": "legacy-sabr-compat"
-	}
+	]
 }
