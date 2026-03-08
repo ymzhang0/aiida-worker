@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import os
 import threading
+import tempfile
 import time
 from contextlib import suppress
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import yaml
 from fastapi import HTTPException, Query, UploadFile, File, Form, Depends
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from aiida import orm
@@ -17,12 +21,14 @@ from aiida.common.exceptions import MissingEntryPointError
 from aiida.orm import Group, Node, ProcessNode, QueryBuilder
 from aiida.plugins import DataFactory
 from aiida.plugins.entry_point import get_entry_point_names
+from aiida.tools.archive import create_archive
 from core.engine import (
     SessionCleanupAPIRouter,
     active_profile_name,
     current_mounted_archive,
     db_access_guard,
     ensure_profile_loaded,
+    get_profile_default_user,
     get_system_info_payload,
     http_error,
     load_archive_profile,
@@ -337,7 +343,8 @@ def _create_group(label: str) -> dict[str, Any]:
     if existing:
         raise http_error(409, "Group already exists", label=cleaned)
 
-    group = Group(label=cleaned).store()
+    default_user = get_profile_default_user()
+    group = Group(label=cleaned, user=default_user).store() if default_user is not None else Group(label=cleaned).store()
     _clear_recent_nodes_cache()
     return _serialize_group_item(group)
 
@@ -476,6 +483,48 @@ def _export_group(pk: int) -> dict[str, Any]:
         "group": _serialize_group_item(group),
         "nodes": exported_nodes,
     }
+
+
+def _sanitize_archive_name(filename: str) -> str:
+    safe = Path(filename).name.replace(" ", "_")
+    cleaned = "".join(ch for ch in safe if ch.isalnum() or ch in {"-", "_", "."})
+    if not cleaned:
+        cleaned = "group-export"
+    if not cleaned.endswith(".aiida"):
+        cleaned = f"{cleaned}.aiida"
+    return cleaned
+
+
+def _delete_export_file(path: str) -> None:
+    with suppress(FileNotFoundError):
+        Path(path).unlink()
+
+
+def _export_group_archive_response(pk: int) -> FileResponse:
+    group = _load_group_by_pk(pk)
+    export_root = Path(tempfile.gettempdir()) / "aiida-group-exports"
+    export_root.mkdir(parents=True, exist_ok=True)
+
+    archive_name = _sanitize_archive_name(group.label or f"group-{pk}")
+    archive_path = export_root / f"{uuid4().hex}-{archive_name}"
+
+    try:
+        create_archive(
+            entities=[group, *list(group.nodes)],
+            filename=archive_path,
+            overwrite=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        with suppress(FileNotFoundError):
+            archive_path.unlink()
+        raise http_error(500, "Failed to export group archive", pk=int(pk), reason=str(exc)) from exc
+
+    return FileResponse(
+        path=archive_path,
+        media_type="application/octet-stream",
+        filename=archive_name,
+        background=BackgroundTask(_delete_export_file, str(archive_path)),
+    )
 
 
 def _get_recent_nodes(
@@ -922,9 +971,9 @@ def management_remove_node_from_group(pk: int, node_pk: int) -> dict[str, Any]:
 
 
 @management_router.get("/groups/{pk}/export")
-def management_export_group(pk: int) -> dict[str, Any]:
+def management_export_group(pk: int) -> FileResponse:
     ensure_profile_loaded()
-    return _export_group(pk)
+    return _export_group_archive_response(pk)
 
 
 @management_router.get("/groups/labels")
@@ -933,7 +982,7 @@ def management_group_labels(search: str | None = Query(default=None)) -> dict[st
     return {"items": _list_group_labels(search)}
 
 
-@management_router.get("/groups/{group_name}")
+@management_router.get("/groups/{group_name:path}")
 def management_inspect_group(group_name: str, limit: int = Query(default=20, ge=1, le=500)) -> dict[str, Any]:
     ensure_profile_loaded()
     return _inspect_group(group_name, limit=limit)

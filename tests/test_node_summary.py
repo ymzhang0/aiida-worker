@@ -125,3 +125,59 @@ def test_get_node_summary_prefers_direct_port_links(monkeypatch) -> None:
     assert "child__retrieved" not in summary["outputs"]
     assert summary["incoming"] == 2
     assert summary["outgoing"] == 1
+
+
+class _FakeStructureSite:
+    def __init__(self, kind_name: str, position: list[float]) -> None:
+        self.kind_name = kind_name
+        self.position = position
+
+
+class _FakeScaledPositions:
+    def __init__(self, rows: list[list[float]]) -> None:
+        self._rows = rows
+
+    def tolist(self) -> list[list[float]]:
+        return [list(row) for row in self._rows]
+
+
+class _FakeAtoms:
+    def __init__(self, scaled_positions: list[list[float]]) -> None:
+        self._scaled_positions = scaled_positions
+
+    def get_scaled_positions(self, wrap: bool = False) -> _FakeScaledPositions:  # noqa: ARG002
+        return _FakeScaledPositions(self._scaled_positions)
+
+
+class _FakeStructureNode:
+    def __init__(self) -> None:
+        self.sites = [
+            _FakeStructureSite("Si", [0.0, 0.0, 0.0]),
+            _FakeStructureSite("Si", [1.3575, 1.3575, 1.3575]),
+        ]
+
+    def get_ase(self) -> _FakeAtoms:
+        return _FakeAtoms([
+            [0.0, 0.0, 0.0],
+            [0.25, 0.25, 0.25],
+        ])
+
+
+def test_structure_preview_includes_fractional_positions_from_backend() -> None:
+    serializer = node_utils.StructureDataSerializer()
+
+    preview = serializer.build_preview(_FakeStructureNode())
+
+    assert preview is not None
+    assert preview["positions"] == [
+        {
+            "kind": "Si",
+            "position": [0.0, 0.0, 0.0],
+            "fractional_position": [0.0, 0.0, 0.0],
+        },
+        {
+            "kind": "Si",
+            "position": [1.3575, 1.3575, 1.3575],
+            "fractional_position": [0.25, 0.25, 0.25],
+        },
+    ]

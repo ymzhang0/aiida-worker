@@ -18,13 +18,16 @@ from core.submission_utils import (
     _load_workflow,
     _prepare_and_validate,
     _submit_validated_workflow,
+    _submit_validated_workflow_payload,
     _submit_workchain_builder,
     _validate_job_payload,
     _validate_workchain_builder,
+    batch_submit,
     resolve_generic_inputs,
 )
 from core.utils import serialize_spec, to_jsonable, type_to_string
 from models.schemas import (
+    BatchSubmitResponse,
     BuilderDraftRequest,
     BuilderDraftResponse,
     BuilderScriptResponse,
@@ -48,7 +51,20 @@ _RESERVED_BUILDER_KEYS = {
     "intent_data",
     "draft",
     "inputs",
+    "batch",
+    "batch_context",
 }
+
+
+def _extract_batch_payload(payload: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    for key in ("batch", "batch_context"):
+        candidate = payload.get(key)
+        if candidate is None:
+            continue
+        if not isinstance(candidate, Mapping):
+            raise http_error(400, f"Field '{key}' must be an object")
+        return candidate
+    return None
 
 
 @submission_router.get("/spec/{entry_point:path}", response_model=SpecResponse)
@@ -134,7 +150,7 @@ def submission_validate_job(payload: JobValidationRequest) -> JobValidationRespo
     )
 
 
-@submission_router.post("/submit", response_model=SubmitResponse | ValidationResponse)
+@submission_router.post("/submit", response_model=SubmitResponse | BatchSubmitResponse | ValidationResponse)
 async def submission_submit(payload: dict[str, Any]) -> Any:
     """
     Unified submission endpoint.
@@ -153,16 +169,47 @@ async def submission_submit(payload: dict[str, Any]) -> Any:
             raw_inputs = {}
         if not isinstance(raw_inputs, Mapping):
             raise http_error(400, "Field 'inputs' must be an object for workflow submission")
+        batch_payload = _extract_batch_payload(payload)
+        if batch_payload is not None:
+            return batch_submit(
+                _submit_validated_workflow_payload,
+                base_payload={"entry_point": entry_point, "inputs": dict(raw_inputs)},
+                batch_data=batch_payload,
+                default_root="inputs",
+                default_structure_path="inputs.structure",
+            )
         return _submit_validated_workflow(entry_point=entry_point, inputs=raw_inputs)
 
-    draft_payload: Mapping[str, Any] | None = None
+    draft_payload: Mapping[str, Any] | Sequence[Mapping[str, Any]] | None = None
     maybe_draft = payload.get("draft")
     if isinstance(maybe_draft, Mapping):
+        draft_payload = maybe_draft
+    elif isinstance(maybe_draft, Sequence) and not isinstance(maybe_draft, (str, bytes, bytearray)):
         draft_payload = maybe_draft
     elif any(key in payload for key in ("workchain", "intent_data", "protocol", "overrides")):
         draft_payload = payload
 
     if draft_payload is not None:
+        batch_payload = _extract_batch_payload(payload)
+        if batch_payload is None and isinstance(draft_payload, Mapping):
+            batch_payload = _extract_batch_payload(draft_payload)
+        if isinstance(draft_payload, Sequence) and not isinstance(draft_payload, Mapping):
+            return batch_submit(
+                _submit_workchain_builder,
+                requests=draft_payload,
+            )
+        if batch_payload is not None and isinstance(draft_payload, Mapping):
+            return batch_submit(
+                _submit_workchain_builder,
+                base_payload={
+                    str(key): value
+                    for key, value in dict(draft_payload).items()
+                    if key not in {"batch", "batch_context"}
+                },
+                batch_data=batch_payload,
+                default_root="intent_data",
+                default_structure_path="intent_data.structure_pk",
+            )
         return _submit_workchain_builder(draft_payload)
 
     raise http_error(
@@ -191,9 +238,20 @@ def submission_draft_builder(payload: BuilderDraftRequest) -> Any:
     )
 
 
-@submission_router.post("/submit-builder", response_model=SubmitResponse)
+@submission_router.post("/submit-builder", response_model=SubmitResponse | BatchSubmitResponse)
 async def submission_submit_builder(payload: BuilderSubmitRequest) -> Any:
     ensure_profile_loaded()
+    if isinstance(payload.draft, list):
+        return batch_submit(_submit_workchain_builder, requests=payload.draft)
+    batch_payload = payload.batch or _extract_batch_payload(payload.draft) or {}
+    if batch_payload:
+        return batch_submit(
+            _submit_workchain_builder,
+            base_payload=payload.draft,
+            batch_data=batch_payload,
+            default_root="intent_data",
+            default_structure_path="intent_data.structure_pk",
+        )
     return _submit_workchain_builder(payload.draft)
 
 

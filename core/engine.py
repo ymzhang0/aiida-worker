@@ -8,6 +8,7 @@ from copy import deepcopy
 from functools import wraps
 from inspect import iscoroutinefunction
 from pathlib import Path
+from types import MethodType
 from typing import Any, Mapping
 
 from fastapi import APIRouter, HTTPException
@@ -245,6 +246,26 @@ def _configure_storage_engine_pool() -> None:
         bind.dispose()
 
 
+def reset_storage_backend_caches() -> None:
+    """Drop process-wide backend caches that can leak ORM state across requests/threads."""
+    try:
+        manager = get_manager()
+        storage = manager.get_profile_storage()
+        if hasattr(storage, "is_closed") and storage.is_closed():
+            return
+        if hasattr(storage, "_backend") and getattr(storage._backend, "is_closed", lambda: False)():
+            return
+    except Exception:  # noqa: BLE001
+        return
+
+    for candidate in {storage, getattr(storage, "_backend", None)}:
+        if candidate is None:
+            continue
+        if hasattr(candidate, "_default_user"):
+            with suppress(Exception):
+                setattr(candidate, "_default_user", None)
+
+
 def cleanup_storage_session() -> None:
     """Release thread-local SQLAlchemy sessions for the active profile backend."""
     try:
@@ -290,6 +311,174 @@ def cleanup_storage_session() -> None:
             with suppress(Exception):
                 remove()
 
+    reset_storage_backend_caches()
+
+
+def list_profile_users() -> list[orm.User]:
+    collection = orm.User.collection
+    list_all = getattr(collection, "all", None)
+    if callable(list_all):
+        users = list(list_all())
+        if users:
+            return users
+
+    find_users = getattr(collection, "find", None)
+    if callable(find_users):
+        users = list(find_users())
+        if users:
+            return users
+
+    qb = QueryBuilder()
+    qb.append(orm.User, project=["*"])
+    return [row[0] for row in qb.all()]
+
+
+def get_profile_default_user() -> orm.User | None:
+    from aiida.manage.configuration import get_profile
+    from aiida.orm.entities import from_backend_entity
+
+    default_email = str(getattr(get_profile(), "default_user_email", "") or "").strip()
+    try:
+        manager = get_manager()
+        storage = manager.get_profile_storage()
+        backend = getattr(storage, "_backend", storage)
+    except Exception:  # noqa: BLE001
+        storage = None
+        backend = None
+
+    backend_users = getattr(backend, "users", None) if backend is not None else None
+    entity_cls = getattr(backend_users, "ENTITY_CLASS", None)
+    model_cls = getattr(entity_cls, "MODEL_CLASS", None)
+    get_session = getattr(backend, "get_session", None)
+
+    if default_email and callable(get_session) and entity_cls is not None and model_cls is not None:
+        try:
+            session = get_session()
+            dbmodel = session.query(model_cls).filter(model_cls.email == default_email).one_or_none()
+            if dbmodel is not None:
+                backend_user = entity_cls.from_dbmodel(dbmodel, backend)
+                return from_backend_entity(orm.User, backend_user)
+        except Exception:  # noqa: BLE001
+            pass
+
+    if default_email:
+        try:
+            collection = orm.User.get_collection(storage if storage is not None else get_manager().get_profile_storage())
+            return collection.get(email=default_email)
+        except Exception:  # noqa: BLE001
+            pass
+
+    get_default = getattr(orm.User.collection, "get_default", None)
+    if callable(get_default):
+        try:
+            return get_default()
+        except Exception:  # noqa: BLE001
+            pass
+
+    users = list_profile_users()
+    return users[0] if users else None
+
+
+def _match_user_filter(user: orm.User, filters: dict[str, Any]) -> bool:
+    for raw_key, expected in filters.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        actual = getattr(user, key, None)
+        if isinstance(expected, dict):
+            if "like" not in expected:
+                return False
+            needle = str(expected.get("like") or "")
+            haystack = str(actual or "")
+            if needle.startswith("%") and needle.endswith("%"):
+                if needle.strip("%") not in haystack:
+                    return False
+                continue
+            if needle.startswith("%"):
+                if not haystack.endswith(needle[1:]):
+                    return False
+                continue
+            if needle.endswith("%"):
+                if not haystack.startswith(needle[:-1]):
+                    return False
+                continue
+            if haystack != needle:
+                return False
+            continue
+        if actual != expected:
+            return False
+    return True
+
+
+def _find_profile_users(filters: dict[str, Any] | None = None) -> list[orm.User]:
+    users = list_profile_users()
+    if not filters:
+        return users
+    return [user for user in users if _match_user_filter(user, filters)]
+
+
+def _get_profile_user_by_filters(filters: dict[str, Any]) -> orm.User:
+    matches = _find_profile_users(filters)
+    if not matches:
+        raise ValueError(f"No user matched filters: {filters}")
+    if len(matches) > 1:
+        raise ValueError(f"Multiple users matched filters: {filters}")
+    return matches[0]
+
+
+def install_user_collection_compatibility(collection: Any) -> None:
+    if collection is None:
+        return
+    if not callable(getattr(collection, "get_default", None)):
+        collection.get_default = MethodType(lambda _self: get_profile_default_user(), collection)
+    if not callable(getattr(collection, "all", None)):
+        collection.all = MethodType(lambda _self: list(list_profile_users()), collection)
+    if not callable(getattr(collection, "find", None)):
+        collection.find = MethodType(
+            lambda _self, filters=None: list(_find_profile_users(filters if isinstance(filters, dict) else None)),
+            collection,
+        )
+    if not callable(getattr(collection, "get", None)):
+        collection.get = MethodType(
+            lambda _self, **filters: _get_profile_user_by_filters(
+                {str(key): value for key, value in filters.items() if str(key).strip()}
+            ),
+            collection,
+        )
+
+
+def prime_storage_user_context() -> orm.User | None:
+    """Bind a fresh default user to the active storage/backend for the current request."""
+    try:
+        manager = get_manager()
+        storage = manager.get_profile_storage()
+        if hasattr(storage, "is_closed") and storage.is_closed():
+            return None
+        if hasattr(storage, "_backend") and getattr(storage._backend, "is_closed", lambda: False)():
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+
+    backend = getattr(storage, "_backend", storage)
+    reset_storage_backend_caches()
+    default_user = get_profile_default_user()
+
+    for owner in (storage, backend):
+        if owner is None or default_user is None:
+            continue
+        if hasattr(owner, "_default_user"):
+            with suppress(Exception):
+                setattr(owner, "_default_user", default_user)
+
+    for owner in {storage, backend, getattr(storage, "users", None), getattr(backend, "users", None)}:
+        if owner is None:
+            continue
+        users = owner if owner.__class__.__name__.endswith("UserCollection") else getattr(owner, "users", None)
+        if users is not None:
+            install_user_collection_compatibility(users)
+
+    return default_user
+
 
 def _wrap_endpoint_with_session_cleanup(endpoint: Any) -> Any:
     """Wrap FastAPI endpoints so cleanup runs in the same execution context."""
@@ -301,6 +490,8 @@ def _wrap_endpoint_with_session_cleanup(endpoint: Any) -> Any:
         @wraps(endpoint)
         async def _async_wrapped(*args: Any, **kwargs: Any) -> Any:
             try:
+                reset_storage_backend_caches()
+                prime_storage_user_context()
                 return await endpoint(*args, **kwargs)
             finally:
                 cleanup_storage_session()
@@ -311,6 +502,8 @@ def _wrap_endpoint_with_session_cleanup(endpoint: Any) -> Any:
         @wraps(endpoint)
         def _sync_wrapped(*args: Any, **kwargs: Any) -> Any:
             try:
+                reset_storage_backend_caches()
+                prime_storage_user_context()
                 return endpoint(*args, **kwargs)
             finally:
                 cleanup_storage_session()

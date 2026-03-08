@@ -47,6 +47,31 @@ class SubmitResponse(BaseModel):
     state: str
 
 
+class BatchSubmitItemResponse(BaseModel):
+    index: int
+    request: dict[str, Any] = Field(default_factory=dict)
+    response: dict[str, Any] = Field(default_factory=dict)
+
+
+class BatchSubmitFailureResponse(BaseModel):
+    index: int
+    request: dict[str, Any] = Field(default_factory=dict)
+    status_code: int
+    detail: dict[str, Any] = Field(default_factory=dict)
+
+
+class BatchSubmitResponse(BaseModel):
+    status: str
+    total: int
+    submitted_count: int
+    failed_count: int
+    submitted_pks: list[int] = Field(default_factory=list)
+    process_pks: list[int] = Field(default_factory=list)
+    responses: list[BatchSubmitItemResponse] = Field(default_factory=list)
+    failures: list[BatchSubmitFailureResponse] = Field(default_factory=list)
+    batch_context: dict[str, Any] = Field(default_factory=dict)
+
+
 class SystemCountsResponse(BaseModel):
     computers: int
     codes: int
@@ -162,7 +187,8 @@ class BuilderDraftRequest(BaseModel):
 
 
 class BuilderSubmitRequest(BaseModel):
-    draft: dict[str, Any]
+    draft: dict[str, Any] | list[dict[str, Any]]
+    batch: dict[str, Any] = Field(default_factory=dict)
 
 
 class SubmissionScriptRequest(BaseModel):

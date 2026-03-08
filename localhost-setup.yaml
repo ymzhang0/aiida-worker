@@ -1,0 +1,13 @@
+append_text: ''
+default_memory_per_machine: null
+description: Localhost automatically created by `verdi presto`
+hostname: localhost
+label: localhost
+mpiprocs_per_machine: 1
+mpirun_command: mpirun -np {tot_num_mpiprocs}
+prepend_text: ''
+scheduler: core.direct
+shebang: '#!/bin/bash'
+transport: core.local
+use_double_quotes: false
+work_dir: /Users/yimingzhang/.aiida/scratch/dev

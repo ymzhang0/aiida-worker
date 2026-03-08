@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import copy
 import inspect
 import json
 import subprocess
 import sys
+from dataclasses import dataclass, field
+from itertools import product
 from typing import Any, Mapping, Sequence, get_args, get_origin
 
 from fastapi import HTTPException
@@ -13,11 +16,19 @@ from aiida.engine import submit
 from aiida.engine.processes.ports import InputPort, PortNamespace
 from aiida.plugins import WorkflowFactory
 
-from core.engine import active_profile_name, http_error
+from core.engine import (
+    active_profile_name,
+    cleanup_storage_session,
+    http_error,
+    prime_storage_user_context,
+    reset_storage_backend_caches,
+)
 from core.utils import serialize_spec, to_jsonable, type_to_string
 
 
 _MISSING = object()
+_BATCH_ASSIGNMENT_ROOTS = ("inputs", "intent_data", "overrides")
+_DEFAULT_BATCH_MAX_JOBS = 1000
 _RESERVED_BUILDER_KEYS = {
     "entry_point",
     "workchain",
@@ -26,6 +37,8 @@ _RESERVED_BUILDER_KEYS = {
     "intent_data",
     "draft",
     "inputs",
+    "batch",
+    "batch_context",
     "structure_pk",
     "code",
 }
@@ -101,6 +114,415 @@ def _serialize_builder_inputs_payload(value: Any) -> Any:
         return [_serialize_builder_inputs_payload(item) for item in value]
 
     return to_jsonable(value)
+
+
+@dataclass(slots=True)
+class BatchContext:
+    items: list[dict[str, Any]] = field(default_factory=list)
+    structures: list[Any] = field(default_factory=list)
+    structure_path: str | None = None
+    parameter_grid: dict[str, list[Any]] = field(default_factory=dict)
+    matrix_mode: str = "product"
+    max_jobs: int = _DEFAULT_BATCH_MAX_JOBS
+    source_group: dict[str, Any] | None = None
+
+    def summary(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "matrix_mode": self.matrix_mode,
+            "structure_path": self.structure_path,
+            "structure_count": len(self.structures),
+            "parameter_paths": list(self.parameter_grid.keys()),
+            "item_count": len(self.items),
+            "max_jobs": self.max_jobs,
+        }
+        if self.source_group:
+            payload["source_group"] = dict(self.source_group)
+        return payload
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _serialize_batch_payload(payload: Any) -> Any:
+    return _serialize_builder_inputs_payload(payload)
+
+
+def _normalize_batch_assignment_path(path: Any, *, default_root: str | None) -> str:
+    cleaned = str(path or "").strip()
+    if not cleaned:
+        raise http_error(400, "Batch assignment path is required")
+
+    root = cleaned.split(".", 1)[0]
+    if root in _BATCH_ASSIGNMENT_ROOTS or default_root is None:
+        return cleaned
+    return f"{default_root}.{cleaned}"
+
+
+def _set_dotted_mapping_value(payload: dict[str, Any], path: str, value: Any) -> None:
+    segments = [segment for segment in str(path).split(".") if segment]
+    if not segments:
+        raise http_error(400, "Batch assignment path is required")
+
+    cursor = payload
+    for segment in segments[:-1]:
+        existing = cursor.get(segment)
+        if not isinstance(existing, dict):
+            existing = {}
+            cursor[segment] = existing
+        cursor = existing
+    cursor[segments[-1]] = copy.deepcopy(value)
+
+
+def _deep_merge_mappings(target: dict[str, Any], patch: Mapping[str, Any]) -> dict[str, Any]:
+    for key, value in patch.items():
+        key_text = str(key)
+        if isinstance(value, Mapping) and isinstance(target.get(key_text), dict):
+            _deep_merge_mappings(target[key_text], value)
+            continue
+        target[key_text] = copy.deepcopy(value)
+    return target
+
+
+def _apply_batch_fragment(
+    payload: dict[str, Any],
+    fragment: Mapping[str, Any],
+    *,
+    default_root: str | None,
+) -> dict[str, Any]:
+    direct_top_level_keys = {
+        "entry_point",
+        "workchain",
+        "protocol",
+        "draft",
+        "batch",
+        "batch_context",
+    }
+    for raw_key, raw_value in fragment.items():
+        key = str(raw_key).strip()
+        if not key:
+            continue
+
+        if key in _BATCH_ASSIGNMENT_ROOTS and isinstance(raw_value, Mapping):
+            current = payload.get(key)
+            if not isinstance(current, dict):
+                current = {}
+                payload[key] = current
+            _deep_merge_mappings(current, raw_value)
+            continue
+
+        if key in direct_top_level_keys:
+            payload[key] = copy.deepcopy(raw_value)
+            continue
+
+        if "." in key or key not in _BATCH_ASSIGNMENT_ROOTS:
+            assignment_path = _normalize_batch_assignment_path(key, default_root=default_root)
+            _set_dotted_mapping_value(payload, assignment_path, raw_value)
+            continue
+
+        payload[key] = copy.deepcopy(raw_value)
+
+    return payload
+
+
+def _load_group_for_batch(reference: Any) -> orm.Group:
+    if isinstance(reference, orm.Group):
+        return reference
+
+    if isinstance(reference, Mapping):
+        for key in ("pk", "group_pk", "id"):
+            parsed = _coerce_positive_int(reference.get(key))
+            if parsed is not None:
+                try:
+                    return orm.load_group(parsed)
+                except Exception as exc:  # noqa: BLE001
+                    raise http_error(404, "Batch group not found", group=parsed, reason=str(exc)) from exc
+
+        for key in ("uuid", "group_uuid", "label", "group_label", "group"):
+            value = reference.get(key)
+            if value in (None, ""):
+                continue
+            try:
+                return orm.load_group(value)
+            except Exception:
+                try:
+                    return orm.Group.collection.get(label=str(value).strip())
+                except Exception as exc:  # noqa: BLE001
+                    raise http_error(404, "Batch group not found", group=value, reason=str(exc)) from exc
+
+    if isinstance(reference, (int, str)):
+        try:
+            return orm.load_group(reference)
+        except Exception:
+            try:
+                return orm.Group.collection.get(label=str(reference).strip())
+            except Exception as exc:  # noqa: BLE001
+                raise http_error(404, "Batch group not found", group=reference, reason=str(exc)) from exc
+
+    raise http_error(400, "Batch structures must be a node list or a valid group reference")
+
+
+def _resolve_batch_structures(raw_structures: Any) -> tuple[list[Any], dict[str, Any] | None]:
+    if raw_structures is None:
+        return [], None
+
+    if isinstance(raw_structures, Mapping) and isinstance(raw_structures.get("nodes"), Sequence) and not isinstance(raw_structures.get("nodes"), (str, bytes, bytearray)):
+        nodes = list(raw_structures.get("nodes") or [])
+        return nodes, None
+
+    if isinstance(raw_structures, Sequence) and not isinstance(raw_structures, (str, bytes, bytearray, Mapping)):
+        return list(raw_structures), None
+
+    group = _load_group_for_batch(raw_structures)
+    nodes = sorted(
+        list(getattr(group, "nodes", [])),
+        key=lambda node: _coerce_positive_int(getattr(node, "pk", None)) or 0,
+    )
+    if not nodes:
+        raise http_error(400, "Batch group contains no nodes", group=getattr(group, "label", None) or getattr(group, "pk", None))
+    return nodes, {
+        "pk": _coerce_positive_int(getattr(group, "pk", None)),
+        "label": str(getattr(group, "label", "") or "").strip() or None,
+        "count": len(nodes),
+    }
+
+
+def _normalize_batch_axis_values(name: str, value: Any) -> list[Any]:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        values = list(value)
+    else:
+        raise http_error(400, f"Batch field '{name}' must be an array")
+
+    if not values:
+        raise http_error(400, f"Batch field '{name}' cannot be empty")
+    return values
+
+
+def _parse_batch_context(
+    batch_data: Mapping[str, Any],
+    *,
+    default_root: str | None,
+    default_structure_path: str | None,
+) -> BatchContext:
+    raw_items = batch_data.get("items") or []
+    if raw_items and (not isinstance(raw_items, Sequence) or isinstance(raw_items, (str, bytes, bytearray))):
+        raise http_error(400, "Batch field 'items' must be an array of objects")
+
+    items: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_items):
+        if not isinstance(item, Mapping):
+            raise http_error(400, "Batch item must be an object", index=index)
+        items.append(dict(item))
+
+    structures, source_group = _resolve_batch_structures(batch_data.get("structures"))
+    structure_path = batch_data.get("structure_path") or batch_data.get("structure_field") or default_structure_path
+    if structures:
+        structure_path = _normalize_batch_assignment_path(structure_path, default_root=default_root)
+
+    raw_parameter_grid = batch_data.get("parameter_grid") or batch_data.get("parameters") or {}
+    if raw_parameter_grid and not isinstance(raw_parameter_grid, Mapping):
+        raise http_error(400, "Batch field 'parameter_grid' must be an object")
+
+    parameter_grid: dict[str, list[Any]] = {}
+    for raw_key, raw_value in dict(raw_parameter_grid).items():
+        parameter_grid[_normalize_batch_assignment_path(raw_key, default_root=default_root)] = _normalize_batch_axis_values(
+            str(raw_key),
+            raw_value,
+        )
+
+    matrix_mode = str(batch_data.get("matrix_mode") or "product").strip().lower()
+    if matrix_mode not in {"product", "zip"}:
+        raise http_error(400, "Batch field 'matrix_mode' must be 'product' or 'zip'")
+
+    max_jobs = _coerce_positive_int(batch_data.get("max_jobs")) or _DEFAULT_BATCH_MAX_JOBS
+
+    context = BatchContext(
+        items=items,
+        structures=structures,
+        structure_path=structure_path,
+        parameter_grid=parameter_grid,
+        matrix_mode=matrix_mode,
+        max_jobs=max_jobs,
+        source_group=source_group,
+    )
+    if not context.items and not context.structures and not context.parameter_grid:
+        raise http_error(400, "Batch payload must include 'items', 'structures', or 'parameter_grid'")
+    return context
+
+
+def _build_batch_axis_assignments(batch_context: BatchContext) -> list[list[tuple[str, Any]]]:
+    axes: list[tuple[str, list[Any]]] = []
+    if batch_context.structures:
+        if not batch_context.structure_path:
+            raise http_error(400, "Batch structures require 'structure_path' or 'structure_field'")
+        axes.append((batch_context.structure_path, list(batch_context.structures)))
+
+    for path, values in batch_context.parameter_grid.items():
+        axes.append((path, list(values)))
+
+    if not axes:
+        return [[]]
+
+    lengths = {len(values) for _, values in axes}
+    if any(length == 0 for length in lengths):
+        raise http_error(400, "Batch axes cannot be empty")
+
+    if batch_context.matrix_mode == "zip":
+        if len(lengths) > 1:
+            raise http_error(400, "Batch zip mode requires all axes to have the same length")
+        shared_length = next(iter(lengths))
+        return [[(path, values[index]) for path, values in axes] for index in range(shared_length)]
+
+    axis_paths = [path for path, _values in axes]
+    axis_values = [values for _path, values in axes]
+    return [list(zip(axis_paths, values)) for values in product(*axis_values)]
+
+
+def _expand_batch_requests(
+    base_payload: Mapping[str, Any],
+    batch_context: BatchContext,
+    *,
+    default_root: str | None,
+) -> list[dict[str, Any]]:
+    item_fragments = batch_context.items or [{}]
+    axis_assignments = _build_batch_axis_assignments(batch_context)
+    total_jobs = len(item_fragments) * len(axis_assignments)
+    if total_jobs > batch_context.max_jobs:
+        raise http_error(
+            400,
+            "Batch expansion exceeds max_jobs",
+            total_jobs=total_jobs,
+            max_jobs=batch_context.max_jobs,
+        )
+
+    expanded: list[dict[str, Any]] = []
+    for item_fragment in item_fragments:
+        for assignments in axis_assignments:
+            job_payload = copy.deepcopy(dict(base_payload))
+            if item_fragment:
+                _apply_batch_fragment(job_payload, item_fragment, default_root=default_root)
+            for path, value in assignments:
+                _set_dotted_mapping_value(job_payload, path, value)
+            expanded.append(job_payload)
+    return expanded
+
+
+def _extract_submission_pk(payload: Any) -> int | None:
+    if not isinstance(payload, Mapping):
+        return None
+    for key in ("pk", "submitted_pk", "process_pk", "workflow_pk"):
+        parsed = _coerce_positive_int(payload.get(key))
+        if parsed is not None:
+            return parsed
+    submitted = payload.get("submitted_pks")
+    if isinstance(submitted, Sequence) and not isinstance(submitted, (str, bytes, bytearray)):
+        for item in submitted:
+            parsed = _coerce_positive_int(item)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def batch_submit(
+    submitter: Any,
+    *,
+    base_payload: Mapping[str, Any] | None = None,
+    batch_data: Mapping[str, Any] | None = None,
+    requests: Sequence[Mapping[str, Any]] | None = None,
+    default_root: str | None = None,
+    default_structure_path: str | None = None,
+) -> dict[str, Any]:
+    expanded_requests: list[dict[str, Any]]
+    batch_context_summary: dict[str, Any] = {}
+
+    if requests is not None:
+        expanded_requests = []
+        for index, item in enumerate(requests):
+            if not isinstance(item, Mapping):
+                raise http_error(400, "Batch request item must be an object", index=index)
+            expanded_requests.append(dict(item))
+        batch_context_summary = {
+            "request_count": len(expanded_requests),
+            "mode": "explicit_requests",
+        }
+    else:
+        if base_payload is None or batch_data is None:
+            raise http_error(400, "Batch submission requires either 'requests' or a base payload with batch context")
+        batch_context = _parse_batch_context(
+            batch_data,
+            default_root=default_root,
+            default_structure_path=default_structure_path,
+        )
+        expanded_requests = _expand_batch_requests(
+            base_payload,
+            batch_context,
+            default_root=default_root,
+        )
+        batch_context_summary = batch_context.summary()
+
+    if not expanded_requests:
+        raise http_error(400, "Batch submission produced no requests")
+
+    submitted_pks: list[int] = []
+    responses: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+
+    for index, request_payload in enumerate(expanded_requests):
+        serialized_request = _serialize_batch_payload(request_payload)
+        try:
+            response = submitter(request_payload)
+            normalized_response = _serialize_batch_payload(response)
+            submitted_pk = _extract_submission_pk(response)
+            if submitted_pk is not None:
+                submitted_pks.append(submitted_pk)
+            responses.append(
+                {
+                    "index": index,
+                    "request": serialized_request,
+                    "response": normalized_response,
+                }
+            )
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, Mapping) else {"error": _failure_message_from_http_exception(exc)}
+            failures.append(
+                {
+                    "index": index,
+                    "request": serialized_request,
+                    "status_code": int(exc.status_code),
+                    "detail": to_jsonable(detail),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            failures.append(
+                {
+                    "index": index,
+                    "request": serialized_request,
+                    "status_code": 500,
+                    "detail": {"error": str(exc)},
+                }
+            )
+        finally:
+            cleanup_storage_session()
+            reset_storage_backend_caches()
+            prime_storage_user_context()
+
+    return {
+        "status": "SUBMITTED_BATCH",
+        "total": len(expanded_requests),
+        "submitted_count": len(responses),
+        "failed_count": len(failures),
+        "submitted_pks": submitted_pks,
+        "process_pks": list(submitted_pks),
+        "responses": responses,
+        "failures": failures,
+        "batch_context": _serialize_batch_payload(batch_context_summary),
+    }
 
 
 def _extract_valid_types(port: InputPort | PortNamespace) -> tuple[type[Any], ...]:
@@ -967,6 +1389,8 @@ def _inspect_builder_protocol_signature(workchain: Any) -> dict[str, inspect.Par
 
 
 def _build_dynamic_protocol_builder(draft_data: Mapping[str, Any]) -> dict[str, Any]:
+    reset_storage_backend_caches()
+    prime_storage_user_context()
     entry_point, protocol, intent_data, overrides = _extract_builder_request(draft_data)
     try:
         workchain = _load_workflow(entry_point)
@@ -1209,20 +1633,29 @@ def _submit_workchain_builder(draft_data: Mapping[str, Any]) -> dict[str, Any]:
             recovery_plan=result["recovery_plan"],
         )
 
-    entry_point, protocol, intent_data, overrides = _extract_builder_request(draft_data)
-    script = _render_dynamic_submission_script(
-        entry_point=entry_point,
-        profile_name=active_profile_name(),
-        protocol=protocol,
-        intent_data=intent_data,
-        overrides=overrides,
-    )
-    payload = _run_submission_script(script, entry_point=entry_point)
+    builder = result.get("builder")
+    if builder is None:
+        raise http_error(500, "Builder submission failed", reason="Validated builder is unavailable")
+
+    try:
+        reset_storage_backend_caches()
+        prime_storage_user_context()
+        node = submit(builder)
+    except Exception as exc:  # noqa: BLE001
+        raise http_error(
+            500,
+            "Builder submission failed",
+            entry_point=result.get("entry_point"),
+            reason=str(exc),
+        ) from exc
+
+    process_state = getattr(node, "process_state", None)
+    state = process_state.value if hasattr(process_state, "value") else str(process_state or "created")
     return {
         "status": "submitted",
-        "pk": int(payload.get("pk") or 0),
-        "uuid": str(payload.get("uuid") or ""),
-        "state": "created",
+        "pk": int(node.pk),
+        "uuid": str(node.uuid),
+        "state": state,
     }
 
 
@@ -1488,3 +1921,16 @@ def _submit_validated_workflow(entry_point: str, inputs: Mapping[str, Any] | Non
     process_state = getattr(node, "process_state", None)
     state = process_state.value if hasattr(process_state, "value") else str(process_state or "created")
     return {"pk": int(node.pk), "uuid": str(node.uuid), "state": state}
+
+
+def _submit_validated_workflow_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    entry_point = str(payload.get("entry_point") or payload.get("workchain") or "").strip()
+    if not entry_point:
+        raise http_error(400, "Workflow submission requires 'entry_point'")
+
+    raw_inputs = payload.get("inputs", {})
+    if raw_inputs is None:
+        raw_inputs = {}
+    if not isinstance(raw_inputs, Mapping):
+        raise http_error(400, "Field 'inputs' must be an object for workflow submission")
+    return _submit_validated_workflow(entry_point=entry_point, inputs=raw_inputs)

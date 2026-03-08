@@ -182,6 +182,42 @@ def get_node_script_payload(node_pk: int) -> dict[str, Any]:
     }
 
 
+def _build_structure_position_preview(node: orm.StructureData, *, limit: int = 50) -> list[dict[str, Any]] | None:
+    preview_sites: list[Any] = []
+    with suppress(Exception):
+        preview_sites = list(node.sites[:limit])
+
+    if not preview_sites:
+        return None
+
+    fractional_positions: list[list[float]] | None = None
+
+    with suppress(Exception):
+        atoms = node.get_ase()
+        scaled_positions = atoms.get_scaled_positions(wrap=False).tolist()
+        if len(scaled_positions) >= len(preview_sites):
+            fractional_positions = [[float(coord) for coord in row] for row in scaled_positions[:len(preview_sites)]]
+
+    if fractional_positions is None:
+        with suppress(Exception):
+            struct = node.get_pymatgen_structure()
+            scaled_positions = struct.frac_coords.tolist()
+            if len(scaled_positions) >= len(preview_sites):
+                fractional_positions = [[float(coord) for coord in row] for row in scaled_positions[:len(preview_sites)]]
+
+    positions: list[dict[str, Any]] = []
+    for index, site in enumerate(preview_sites):
+        entry: dict[str, Any] = {
+            "kind": str(site.kind_name),
+            "position": [float(coord) for coord in site.position],
+        }
+        if fractional_positions is not None and index < len(fractional_positions):
+            entry["fractional_position"] = fractional_positions[index]
+        positions.append(entry)
+
+    return positions
+
+
 class StructureDataSerializer:
     def build_preview(self, node: orm.StructureData) -> dict[str, Any] | None:
         atom_count: int | None = None
@@ -195,13 +231,7 @@ class StructureDataSerializer:
         with suppress(Exception):
             cell_volume = node.get_cell_volume()
         with suppress(Exception):
-            # Extract first 50 sites for preview
-            positions = []
-            for site in node.sites[:50]:
-                positions.append({
-                    "kind": str(site.kind_name),
-                    "position": [float(c) for c in site.position]
-                })
+            positions = _build_structure_position_preview(node, limit=50)
 
         # Extra info using pymatgen
         with suppress(Exception):
