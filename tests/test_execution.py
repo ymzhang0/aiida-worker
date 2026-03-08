@@ -3,11 +3,28 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from core.engine import cleanup_storage_session, ensure_profile_loaded, reset_storage_backend_caches
-from routers.execution import _execute_python_script
+from routers.execution import (
+    LEGACY_WORKSPACE_PATH_HEADER,
+    WORKSPACE_PATH_HEADER,
+    _execute_python_script,
+    _request_workspace_path,
+)
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_execution_test_state() -> None:
+    reset_storage_backend_caches()
+    cleanup_storage_session()
+    yield
+    reset_storage_backend_caches()
+    cleanup_storage_session()
 
 
 def _run_script_with_cleanup(script: str) -> dict[str, object]:
@@ -57,3 +74,12 @@ print(structure.pk)
 
     failures = [result for result in results if not result.get("success")]
     assert failures == []
+
+
+def test_request_workspace_path_accepts_aris_and_legacy_headers() -> None:
+    assert _request_workspace_path(SimpleNamespace(headers={WORKSPACE_PATH_HEADER: "/tmp/aris-workspace"})) == (
+        "/tmp/aris-workspace"
+    )
+    assert _request_workspace_path(
+        SimpleNamespace(headers={LEGACY_WORKSPACE_PATH_HEADER: "/tmp/legacy-workspace"})
+    ) == "/tmp/legacy-workspace"

@@ -3,7 +3,7 @@ from __future__ import annotations
 import io
 import threading
 import traceback
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout, suppress
 from types import MethodType
 from typing import Any
 
@@ -28,15 +28,23 @@ from repository.analysis.common_utils import (
 
 execution_router = SessionCleanupAPIRouter(tags=["execution"])
 management_execution_router = SessionCleanupAPIRouter(prefix="/management", tags=["management"])
-WORKSPACE_PATH_HEADER = "X-SABR-Active-Workspace-Path"
+WORKSPACE_PATH_HEADER = "X-ARIS-Active-Workspace-Path"
+LEGACY_WORKSPACE_PATH_HEADER = "X-SABR-Active-Workspace-Path"
+WORKSPACE_PATH_HEADERS = (WORKSPACE_PATH_HEADER, LEGACY_WORKSPACE_PATH_HEADER)
 _RUN_PYTHON_LOCK = threading.Lock()
+_COMPAT_ORIGINAL_MISSING = object()
+_COMPAT_BACKUP_UNSET = object()
+_COMPAT_METHOD_NAMES = ("get_default", "all", "find", "get")
 
 
 def _request_workspace_path(request: Request | None) -> str | None:
     if request is None:
         return None
-    cleaned = str(request.headers.get(WORKSPACE_PATH_HEADER) or "").strip()
-    return cleaned or None
+    for header_name in WORKSPACE_PATH_HEADERS:
+        cleaned = str(request.headers.get(header_name) or "").strip()
+        if cleaned:
+            return cleaned
+    return None
 
 
 def _list_profile_users() -> list[orm.User]:
@@ -126,25 +134,63 @@ def _get_profile_user_by_filters(filters: dict[str, Any]) -> orm.User:
     return matches[0]
 
 
-def _install_user_collection_compatibility(collection: Any) -> None:
+def _install_user_collection_compatibility(collection: Any) -> bool:
     if collection is None:
-        return
-    if not callable(getattr(collection, "get_default", None)):
-        collection.get_default = MethodType(lambda _self: _get_profile_default_user(), collection)
-    if not callable(getattr(collection, "all", None)):
-        collection.all = MethodType(lambda _self: list(_list_profile_users()), collection)
-    if not callable(getattr(collection, "find", None)):
-        collection.find = MethodType(
+        return False
+
+    installed = False
+    method_factories = {
+        "get_default": lambda: MethodType(lambda _self: _get_profile_default_user(), collection),
+        "all": lambda: MethodType(lambda _self: list(_list_profile_users()), collection),
+        "find": lambda: MethodType(
             lambda _self, filters=None: list(_find_profile_users(filters if isinstance(filters, dict) else None)),
             collection,
-        )
-    if not callable(getattr(collection, "get", None)):
-        collection.get = MethodType(
+        ),
+        "get": lambda: MethodType(
             lambda _self, **filters: _get_profile_user_by_filters(
                 {str(key): value for key, value in filters.items() if str(key).strip()}
             ),
             collection,
-        )
+        ),
+    }
+
+    for method_name, factory in method_factories.items():
+        current = getattr(collection, method_name, _COMPAT_ORIGINAL_MISSING)
+        if callable(current):
+            continue
+        setattr(collection, f"_aris_execution_original_{method_name}", current)
+        setattr(collection, method_name, factory())
+        installed = True
+
+    return installed
+
+
+def _restore_user_collection_compatibility(collections: tuple[Any, ...]) -> None:
+    for collection in collections:
+        if collection is None:
+            continue
+        for method_name in _COMPAT_METHOD_NAMES:
+            backup_attr = f"_aris_execution_original_{method_name}"
+            original = getattr(collection, backup_attr, _COMPAT_BACKUP_UNSET)
+            if original is _COMPAT_BACKUP_UNSET:
+                continue
+            if original is _COMPAT_ORIGINAL_MISSING:
+                with suppress(Exception):
+                    delattr(collection, method_name)
+            else:
+                with suppress(Exception):
+                    setattr(collection, method_name, original)
+            with suppress(Exception):
+                delattr(collection, backup_attr)
+
+
+def _clear_bound_default_users(exec_globals: dict[str, Any]) -> None:
+    for owner_key in ("storage", "backend"):
+        owner = exec_globals.get(owner_key)
+        if owner is None or not hasattr(owner, "_default_user"):
+            continue
+        with suppress(Exception):
+            setattr(owner, "_default_user", None)
 
 
 def _install_run_python_compatibility_bindings(exec_globals: dict[str, Any]) -> None:
@@ -161,17 +207,19 @@ def _install_run_python_compatibility_bindings(exec_globals: dict[str, Any]) -> 
         if hasattr(owner, "_default_user"):
             setattr(owner, "_default_user", default_user)
 
+    patched_collections: list[Any] = []
     for owner in {storage, backend, getattr(storage, "users", None), getattr(backend, "users", None)}:
         if owner is None:
             continue
         users = owner if owner.__class__.__name__.endswith("UserCollection") else getattr(owner, "users", None)
-        if users is not None:
-            _install_user_collection_compatibility(users)
+        if users is not None and _install_user_collection_compatibility(users):
+            patched_collections.append(users)
 
     exec_globals["storage"] = storage
     exec_globals["backend"] = backend
     exec_globals["get_default_user"] = _get_profile_default_user
     exec_globals["list_users"] = _list_profile_users
+    exec_globals["_patched_user_collections"] = tuple(patched_collections)
 
 
 def _execute_python_script(script: str, *, workspace_path: str | None = None) -> dict[str, Any]:
@@ -220,6 +268,8 @@ def _execute_python_script(script: str, *, workspace_path: str | None = None) ->
                 "error": traceback.format_exc(),
             }
         finally:
+            _restore_user_collection_compatibility(tuple(exec_globals.get("_patched_user_collections", ())))
+            _clear_bound_default_users(exec_globals)
             cleanup_storage_session()
             reset_storage_backend_caches()
 
