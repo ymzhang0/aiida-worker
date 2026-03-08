@@ -115,7 +115,7 @@ def root():
 
 @app.get("/status")
 def root_status():
-    """Root status endpoint for SABR client compatibility."""
+    """Root status endpoint for ARIS client compatibility."""
     from core.engine import ensure_profile_loaded, get_system_info_payload
     ensure_profile_loaded()
     return get_system_info_payload()
@@ -123,14 +123,14 @@ def root_status():
 
 @app.get("/plugins")
 def root_plugins():
-    """Root plugins endpoint for SABR client compatibility."""
+    """Root plugins endpoint for ARIS client compatibility."""
     from aiida.plugins.entry_point import get_entry_point_names
     return sorted(get_entry_point_names("aiida.workflows"))
 
 
 @app.get("/system/info")
 def root_system_info():
-    """Root system info endpoint for SABR client compatibility."""
+    """Root system info endpoint for ARIS client compatibility."""
     from core.engine import ensure_profile_loaded, get_system_info_payload
     ensure_profile_loaded()
     return get_system_info_payload()
@@ -138,7 +138,7 @@ def root_system_info():
 
 @app.get("/resources")
 def root_resources():
-    """Root resources endpoint for SABR client compatibility."""
+    """Root resources endpoint for ARIS client compatibility."""
     from core.engine import ensure_profile_loaded, serialize_codes, serialize_computers
     ensure_profile_loaded()
     return {
