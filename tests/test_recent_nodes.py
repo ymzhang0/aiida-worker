@@ -63,6 +63,31 @@ class _FakeQueryBuilder:
         return list(self.rows)
 
 
+class _FakeExtras:
+    def __init__(self, values: dict[str, object] | None = None) -> None:
+        self.values = dict(values or {})
+
+    def get(self, key: str, default: object = None) -> object:
+        return self.values.get(key, default)
+
+    def set(self, key: str, value: object) -> None:
+        self.values[key] = value
+
+    def delete(self, key: str) -> None:
+        self.values.pop(key, None)
+
+
+class _FakeNodeBase:
+    def __init__(self, extras: _FakeExtras) -> None:
+        self.extras = extras
+
+
+class _FakeNodeWithExtras:
+    def __init__(self, extras: dict[str, object] | None = None, *, pk: int = 99) -> None:
+        self.pk = pk
+        self.base = _FakeNodeBase(_FakeExtras(extras))
+
+
 def test_get_recent_processes_filters_root_processes_in_python(monkeypatch) -> None:
     rows = [
         (_FakeProcessNode(pk=1, process_label="PwBandsWorkChain", caller=None),),
@@ -122,3 +147,29 @@ def test_get_recent_nodes_skips_root_only_filter_for_data_nodes(monkeypatch) -> 
 
     assert [item["pk"] for item in payload] == [20]
     assert fake_qb.filter_calls == []
+
+
+def test_soft_delete_compatibility_reads_legacy_extra_keys() -> None:
+    node = _FakeNodeWithExtras({data_router._LEGACY_SOFT_DELETED_EXTRA_KEY: True})
+
+    assert data_router._is_soft_deleted(node) is True
+
+
+def test_soft_delete_node_writes_and_clears_canonical_and_legacy_keys(monkeypatch) -> None:
+    node = _FakeNodeWithExtras()
+    monkeypatch.setattr(data_router.orm, "load_node", lambda pk: node)
+    monkeypatch.setattr(data_router, "_clear_recent_nodes_cache", lambda: None)
+
+    deleted_payload = data_router._soft_delete_node(99, deleted=True)
+    assert deleted_payload == {"pk": 99, "soft_deleted": True}
+    assert node.base.extras.values[data_router._SOFT_DELETED_EXTRA_KEY] is True
+    assert node.base.extras.values[data_router._LEGACY_SOFT_DELETED_EXTRA_KEY] is True
+    assert data_router._SOFT_DELETED_AT_EXTRA_KEY in node.base.extras.values
+    assert data_router._LEGACY_SOFT_DELETED_AT_EXTRA_KEY in node.base.extras.values
+
+    restored_payload = data_router._soft_delete_node(99, deleted=False)
+    assert restored_payload == {"pk": 99, "soft_deleted": False}
+    assert data_router._SOFT_DELETED_EXTRA_KEY not in node.base.extras.values
+    assert data_router._LEGACY_SOFT_DELETED_EXTRA_KEY not in node.base.extras.values
+    assert data_router._SOFT_DELETED_AT_EXTRA_KEY not in node.base.extras.values
+    assert data_router._LEGACY_SOFT_DELETED_AT_EXTRA_KEY not in node.base.extras.values

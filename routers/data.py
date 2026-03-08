@@ -75,8 +75,12 @@ _RECENT_NODES_CACHE_TTL_SECONDS = max(0.5, float(os.getenv("AIIDA_RECENT_NODES_C
 _RECENT_NODES_CACHE_MAX_ITEMS = max(10, int(os.getenv("AIIDA_RECENT_NODES_CACHE_MAX_ITEMS", "128")))
 _RECENT_NODES_CACHE_LOCK = threading.Lock()
 _RECENT_NODES_CACHE: dict[tuple[int, str | None, str | None, str | None, str | None, bool], tuple[float, list[dict[str, Any]]]] = {}
-_SOFT_DELETED_EXTRA_KEY = "sabr_soft_deleted"
-_SOFT_DELETED_AT_EXTRA_KEY = "sabr_soft_deleted_at"
+_SOFT_DELETED_EXTRA_KEY = "aris_soft_deleted"
+_SOFT_DELETED_AT_EXTRA_KEY = "aris_soft_deleted_at"
+_LEGACY_SOFT_DELETED_EXTRA_KEY = "sabr_soft_deleted"
+_LEGACY_SOFT_DELETED_AT_EXTRA_KEY = "sabr_soft_deleted_at"
+_SOFT_DELETED_EXTRA_KEYS = (_SOFT_DELETED_EXTRA_KEY, _LEGACY_SOFT_DELETED_EXTRA_KEY)
+_SOFT_DELETED_AT_EXTRA_KEYS = (_SOFT_DELETED_AT_EXTRA_KEY, _LEGACY_SOFT_DELETED_AT_EXTRA_KEY)
 
 _NODE_CLASS_MAP: dict[str, type[Node]] = {
     "ProcessNode": orm.ProcessNode,
@@ -435,7 +439,10 @@ def _remove_node_from_group(pk: int, node_pk: int) -> dict[str, Any]:
 
 def _is_soft_deleted(node: Node) -> bool:
     try:
-        return bool(node.base.extras.get(_SOFT_DELETED_EXTRA_KEY, False))
+        for extra_key in _SOFT_DELETED_EXTRA_KEYS:
+            if bool(node.base.extras.get(extra_key, False)):
+                return True
+        return False
     except Exception:  # noqa: BLE001
         return False
 
@@ -447,13 +454,15 @@ def _soft_delete_node(pk: int, *, deleted: bool = True) -> dict[str, Any]:
         raise http_error(404, "Node not found", pk=int(pk)) from exc
 
     if deleted:
-        node.base.extras.set(_SOFT_DELETED_EXTRA_KEY, True)
-        node.base.extras.set(_SOFT_DELETED_AT_EXTRA_KEY, int(time.time()))
+        deleted_at = int(time.time())
+        for extra_key in _SOFT_DELETED_EXTRA_KEYS:
+            node.base.extras.set(extra_key, True)
+        for extra_key in _SOFT_DELETED_AT_EXTRA_KEYS:
+            node.base.extras.set(extra_key, deleted_at)
     else:
-        with suppress(Exception):
-            node.base.extras.delete(_SOFT_DELETED_EXTRA_KEY)
-        with suppress(Exception):
-            node.base.extras.delete(_SOFT_DELETED_AT_EXTRA_KEY)
+        for extra_key in (*_SOFT_DELETED_EXTRA_KEYS, *_SOFT_DELETED_AT_EXTRA_KEYS):
+            with suppress(Exception):
+                node.base.extras.delete(extra_key)
 
     _clear_recent_nodes_cache()
     return {"pk": int(node.pk), "soft_deleted": bool(deleted)}
