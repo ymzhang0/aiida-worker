@@ -29,8 +29,6 @@ from repository.analysis.common_utils import (
 execution_router = SessionCleanupAPIRouter(tags=["execution"])
 management_execution_router = SessionCleanupAPIRouter(prefix="/management", tags=["management"])
 WORKSPACE_PATH_HEADER = "X-ARIS-Active-Workspace-Path"
-LEGACY_WORKSPACE_PATH_HEADER = "X-SABR-Active-Workspace-Path"
-WORKSPACE_PATH_HEADERS = (WORKSPACE_PATH_HEADER, LEGACY_WORKSPACE_PATH_HEADER)
 _RUN_PYTHON_LOCK = threading.Lock()
 _COMPAT_ORIGINAL_MISSING = object()
 _COMPAT_BACKUP_UNSET = object()
@@ -40,11 +38,8 @@ _COMPAT_METHOD_NAMES = ("get_default", "all", "find", "get")
 def _request_workspace_path(request: Request | None) -> str | None:
     if request is None:
         return None
-    for header_name in WORKSPACE_PATH_HEADERS:
-        cleaned = str(request.headers.get(header_name) or "").strip()
-        if cleaned:
-            return cleaned
-    return None
+    cleaned = str(request.headers.get(WORKSPACE_PATH_HEADER) or "").strip()
+    return cleaned or None
 
 
 def _list_profile_users() -> list[orm.User]:

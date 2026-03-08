@@ -11,7 +11,6 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from core.engine import cleanup_storage_session, ensure_profile_loaded, reset_storage_backend_caches
 from routers.execution import (
-    LEGACY_WORKSPACE_PATH_HEADER,
     WORKSPACE_PATH_HEADER,
     _execute_python_script,
     _request_workspace_path,
@@ -76,10 +75,7 @@ print(structure.pk)
     assert failures == []
 
 
-def test_request_workspace_path_accepts_aris_and_legacy_headers() -> None:
+def test_request_workspace_path_accepts_aris_header() -> None:
     assert _request_workspace_path(SimpleNamespace(headers={WORKSPACE_PATH_HEADER: "/tmp/aris-workspace"})) == (
         "/tmp/aris-workspace"
     )
-    assert _request_workspace_path(
-        SimpleNamespace(headers={LEGACY_WORKSPACE_PATH_HEADER: "/tmp/legacy-workspace"})
-    ) == "/tmp/legacy-workspace"

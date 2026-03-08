@@ -77,10 +77,8 @@ _RECENT_NODES_CACHE_LOCK = threading.Lock()
 _RECENT_NODES_CACHE: dict[tuple[int, str | None, str | None, str | None, str | None, bool], tuple[float, list[dict[str, Any]]]] = {}
 _SOFT_DELETED_EXTRA_KEY = "aris_soft_deleted"
 _SOFT_DELETED_AT_EXTRA_KEY = "aris_soft_deleted_at"
-_LEGACY_SOFT_DELETED_EXTRA_KEY = "sabr_soft_deleted"
-_LEGACY_SOFT_DELETED_AT_EXTRA_KEY = "sabr_soft_deleted_at"
-_SOFT_DELETED_EXTRA_KEYS = (_SOFT_DELETED_EXTRA_KEY, _LEGACY_SOFT_DELETED_EXTRA_KEY)
-_SOFT_DELETED_AT_EXTRA_KEYS = (_SOFT_DELETED_AT_EXTRA_KEY, _LEGACY_SOFT_DELETED_AT_EXTRA_KEY)
+_SOFT_DELETED_EXTRA_KEYS = (_SOFT_DELETED_EXTRA_KEY,)
+_SOFT_DELETED_AT_EXTRA_KEYS = (_SOFT_DELETED_AT_EXTRA_KEY,)
 
 _NODE_CLASS_MAP: dict[str, type[Node]] = {
     "ProcessNode": orm.ProcessNode,
