@@ -13,13 +13,14 @@ from uuid import uuid4
 import yaml
 from fastapi import HTTPException, Query, UploadFile, File, Form, Depends
 from fastapi.responses import FileResponse
+from packaging.version import InvalidVersion, Version
 from starlette.background import BackgroundTask
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
-from aiida import orm
+from aiida import __version__ as AIIDA_CORE_VERSION, orm
 from aiida.common.exceptions import MissingEntryPointError
 from aiida.orm import Group, Node, ProcessNode, QueryBuilder
-from aiida.plugins import DataFactory
+from aiida.plugins import DataFactory, TransportFactory
 from aiida.plugins.entry_point import get_entry_point_names
 from aiida.tools.archive import create_archive
 from core.engine import (
@@ -54,6 +55,7 @@ from models.schemas import (
     GroupAddNodesRequest,
     GroupCreateRequest,
     GroupRenameRequest,
+    InfrastructureCapabilitiesResponse,
     InfrastructureSetupRequest,
     InfrastructureExportResponse,
     NodeScriptResponse,
@@ -87,6 +89,19 @@ _NODE_CLASS_MAP: dict[str, type[Node]] = {
 }
 
 _DATA_ENTRY_POINT_ALIASES: dict[str, str] = get_data_entry_point_aliases()
+_TRANSPORT_ALIASES = {
+    "local": "core.local",
+    "core.local": "core.local",
+    "ssh": "core.ssh",
+    "core.ssh": "core.ssh",
+    "ssh_async": "core.ssh_async",
+    "core.ssh_async": "core.ssh_async",
+    "asyncssh": "core.ssh_async",
+}
+_ASYNC_SSH_TRANSPORT = "core.ssh_async"
+_SYNC_SSH_TRANSPORT = "core.ssh"
+_ASYNC_ONLY_PAYLOAD_FIELDS = ("host", "max_io_allowed", "authentication_script", "backend")
+_SYNC_ONLY_PAYLOAD_FIELDS = ("username", "key_filename", "proxy_command", "proxy_jump", "connection_timeout")
 
 
 def _get_statistics_payload() -> dict[str, Any]:
@@ -1191,6 +1206,150 @@ def get_infrastructure():
     
     return computer_list
 
+
+def _get_supported_transport_names() -> list[str]:
+    available = sorted({str(name) for name in get_entry_point_names("aiida.transports")})
+    preferred = ["core.local", "core.ssh", "core.ssh_async"]
+    ordered = [name for name in preferred if name in available]
+    ordered.extend(name for name in available if name not in ordered)
+    return ordered
+
+
+def _supports_async_ssh_transport() -> bool:
+    try:
+        return Version(str(AIIDA_CORE_VERSION)) >= Version("2.7.0") and _ASYNC_SSH_TRANSPORT in _get_supported_transport_names()
+    except InvalidVersion:
+        return _ASYNC_SSH_TRANSPORT in _get_supported_transport_names()
+
+
+def _normalize_transport_type(transport_type: str | None) -> str:
+    normalized = str(transport_type or "").strip().lower()
+    if not normalized:
+        return _ASYNC_SSH_TRANSPORT if _supports_async_ssh_transport() else _SYNC_SSH_TRANSPORT
+    return _TRANSPORT_ALIASES.get(normalized, str(transport_type or "").strip())
+
+
+def _get_transport_auth_fields(transport_type: str) -> list[str]:
+    try:
+        transport_cls = TransportFactory(transport_type)
+        return [str(field) for field in transport_cls.get_valid_auth_params()]
+    except Exception:
+        return []
+
+
+def _get_infrastructure_capabilities_payload() -> dict[str, Any]:
+    transports = _get_supported_transport_names()
+    supports_async_ssh = _supports_async_ssh_transport()
+    recommended_transport = (
+        _ASYNC_SSH_TRANSPORT
+        if supports_async_ssh
+        else (_SYNC_SSH_TRANSPORT if _SYNC_SSH_TRANSPORT in transports else transports[0] if transports else "core.local")
+    )
+    return {
+        "aiida_core_version": str(AIIDA_CORE_VERSION),
+        "available_transports": transports,
+        "recommended_transport": recommended_transport,
+        "supports_async_ssh": supports_async_ssh,
+        "transport_auth_fields": {
+            transport_type: _get_transport_auth_fields(transport_type)
+            for transport_type in transports
+        },
+    }
+
+
+def _resolve_transport_capabilities(transport_type: str | None) -> tuple[str, dict[str, Any], set[str]]:
+    capabilities = _get_infrastructure_capabilities_payload()
+    normalized = _normalize_transport_type(transport_type)
+    available = set(capabilities["available_transports"])
+    if normalized not in available:
+        raise http_error(
+            422,
+            "Unsupported transport for the installed AiiDA version",
+            transport_type=normalized,
+            aiida_core_version=capabilities["aiida_core_version"],
+            available_transports=capabilities["available_transports"],
+        )
+    auth_fields = set(capabilities["transport_auth_fields"].get(normalized, []))
+    return normalized, capabilities, auth_fields
+
+
+def _build_transport_auth_params(payload: InfrastructureSetupRequest, transport_type: str, auth_fields: set[str]) -> dict[str, Any]:
+    auth_params: dict[str, Any] = {}
+
+    if "use_login_shell" in auth_fields and payload.use_login_shell is not None:
+        auth_params["use_login_shell"] = payload.use_login_shell
+    if "safe_interval" in auth_fields and payload.safe_interval is not None:
+        auth_params["safe_interval"] = payload.safe_interval
+
+    if transport_type == _ASYNC_SSH_TRANSPORT:
+        unsupported = [field for field in _SYNC_ONLY_PAYLOAD_FIELDS if getattr(payload, field, None) not in (None, "", 0)]
+        if unsupported:
+            raise http_error(
+                422,
+                "core.ssh_async uses SSH config style authentication parameters",
+                transport_type=transport_type,
+                unsupported_fields=unsupported,
+                expected_fields=["host", "max_io_allowed", "authentication_script", "backend", "use_login_shell", "safe_interval"],
+            )
+        if "host" in auth_fields:
+            auth_params["host"] = str(payload.host or payload.hostname or "").strip()
+        if "max_io_allowed" in auth_fields and payload.max_io_allowed is not None:
+            auth_params["max_io_allowed"] = int(payload.max_io_allowed)
+        if "script_before" in auth_fields and payload.authentication_script:
+            auth_params["script_before"] = payload.authentication_script
+        if "backend" in auth_fields and payload.backend:
+            auth_params["backend"] = payload.backend
+        return auth_params
+
+    if "username" in auth_fields and payload.username:
+        auth_params["username"] = payload.username
+    if "key_filename" in auth_fields and payload.key_filename:
+        auth_params["key_filename"] = payload.key_filename
+    if "proxy_command" in auth_fields and payload.proxy_command:
+        auth_params["proxy_command"] = payload.proxy_command
+    if "proxy_jump" in auth_fields and payload.proxy_jump:
+        auth_params["proxy_jump"] = payload.proxy_jump
+    if "timeout" in auth_fields and payload.connection_timeout is not None:
+        auth_params["timeout"] = payload.connection_timeout
+
+    return auth_params
+
+
+def _export_auth_payload(computer: Any, auth_params: dict[str, Any]) -> dict[str, Any] | None:
+    transport_type = str(getattr(computer, "transport_type", "") or "")
+
+    if transport_type == _ASYNC_SSH_TRANSPORT:
+        exported = {
+            "host": auth_params.get("host"),
+            "max_io_allowed": auth_params.get("max_io_allowed"),
+            "authentication_script": auth_params.get("script_before"),
+            "backend": auth_params.get("backend"),
+            "use_login_shell": auth_params.get("use_login_shell"),
+            "safe_interval": auth_params.get("safe_interval"),
+        }
+    else:
+        exported = {
+            "username": auth_params.get("username"),
+            "key_filename": auth_params.get("key_filename"),
+            "proxy_command": auth_params.get("proxy_command"),
+            "proxy_jump": auth_params.get("proxy_jump"),
+            "use_login_shell": auth_params.get("use_login_shell"),
+            "safe_interval": auth_params.get("safe_interval"),
+            "connection_timeout": auth_params.get("timeout", auth_params.get("connection_timeout")),
+        }
+
+    trimmed = {key: value for key, value in exported.items() if value not in (None, "", [], {})}
+    return trimmed or None
+
+
+@management_router.get(
+    "/infrastructure/capabilities",
+    response_model=InfrastructureCapabilitiesResponse,
+)
+def get_infrastructure_capabilities() -> InfrastructureCapabilitiesResponse:
+    ensure_profile_loaded()
+    return InfrastructureCapabilitiesResponse(**_get_infrastructure_capabilities_payload())
+
 @management_router.get("/infrastructure/ssh-config")
 def get_ssh_config() -> list[SSHHostDetails]:
     """
@@ -1373,15 +1532,9 @@ def _build_computer_export_response(computer: Any) -> InfrastructureExportRespon
         authinfo = computer.get_authinfo(user)
         auth_params = authinfo.get_auth_params() if hasattr(authinfo, "get_auth_params") else {}
         if isinstance(auth_params, dict) and auth_params:
-            exported["auth"] = {
-                "username": auth_params.get("username"),
-                "key_filename": auth_params.get("key_filename"),
-                "proxy_command": auth_params.get("proxy_command"),
-                "proxy_jump": auth_params.get("proxy_jump"),
-                "use_login_shell": auth_params.get("use_login_shell"),
-                "safe_interval": auth_params.get("safe_interval"),
-                "connection_timeout": auth_params.get("connection_timeout"),
-            }
+            exported_auth = _export_auth_payload(computer, auth_params)
+            if exported_auth:
+                exported["auth"] = exported_auth
 
     return InfrastructureExportResponse(
         kind="computer",
@@ -1457,15 +1610,27 @@ def setup_infrastructure(payload: InfrastructureSetupRequest):
     """
     ensure_profile_loaded()
     try:
+        transport_type, _, auth_fields = _resolve_transport_capabilities(payload.transport_type)
+
         # 1. Computer Setup
         try:
             computer = orm.Computer.collection.get(label=payload.computer_label)
+            if str(computer.transport_type) != transport_type:
+                raise http_error(
+                    409,
+                    "Computer already exists with a different transport type",
+                    computer=payload.computer_label,
+                    existing_transport=str(computer.transport_type),
+                    requested_transport=transport_type,
+                )
+        except HTTPException:
+            raise
         except Exception:
             computer = orm.Computer(
                 label=payload.computer_label,
                 hostname=payload.hostname,
                 description=payload.computer_description or "",
-                transport_type=payload.transport_type,
+                transport_type=transport_type,
                 scheduler_type=payload.scheduler_type,
                 workdir=payload.work_dir
             )
@@ -1489,23 +1654,8 @@ def setup_infrastructure(payload: InfrastructureSetupRequest):
             authinfo = computer.get_authinfo(user)
         except Exception:
             authinfo = orm.AuthInfo(computer=computer, user=user)
-            
-        auth_params = {}
-        if payload.username:
-            auth_params["username"] = payload.username
-        if payload.key_filename:
-            auth_params["key_filename"] = payload.key_filename
-        if payload.proxy_command:
-            auth_params["proxy_command"] = payload.proxy_command
-        if payload.proxy_jump:
-            auth_params["proxy_jump"] = payload.proxy_jump
-        if payload.use_login_shell is not None:
-            auth_params["use_login_shell"] = payload.use_login_shell
-        if payload.safe_interval is not None:
-            auth_params["safe_interval"] = payload.safe_interval
-        if payload.connection_timeout is not None:
-            auth_params["connection_timeout"] = payload.connection_timeout
-            
+
+        auth_params = _build_transport_auth_params(payload, transport_type, auth_fields)
         authinfo.set_auth_params(auth_params)
         authinfo.store()
         
@@ -1551,3 +1701,66 @@ def setup_infrastructure(payload: InfrastructureSetupRequest):
         }
     except Exception as exc:
         raise http_error(500, "Failed to setup infrastructure", reason=str(exc))
+
+
+@management_router.post("/infrastructure/test-connection")
+def test_infrastructure_connection(payload: InfrastructureSetupRequest):
+    """
+    Validate a computer/auth configuration without leaving persistent infrastructure behind.
+    """
+    ensure_profile_loaded()
+    temporary_pk: int | None = None
+
+    try:
+        transport_type, _, auth_fields = _resolve_transport_capabilities(payload.transport_type)
+
+        computer = orm.Computer(
+            label=f"__aris_test__{payload.computer_label or 'computer'}__{uuid4().hex[:8]}",
+            hostname=payload.hostname,
+            description=payload.computer_description or "",
+            transport_type=transport_type,
+            scheduler_type=payload.scheduler_type,
+            workdir=payload.work_dir,
+        )
+        computer.set_default_mpiprocs_per_machine(payload.mpiprocs_per_machine)
+        if payload.mpirun_command:
+            computer.set_mpirun_command(payload.mpirun_command.split())
+        if payload.shebang:
+            computer.set_shebang(payload.shebang)
+        if payload.default_memory_per_machine is not None:
+            computer.set_default_memory_per_machine(payload.default_memory_per_machine)
+        computer.set_use_double_quotes(payload.use_double_quotes)
+        if payload.prepend_text:
+            computer.set_prepend_text(payload.prepend_text)
+        if payload.append_text:
+            computer.set_append_text(payload.append_text)
+        computer.store()
+        temporary_pk = int(computer.pk)
+
+        user = orm.User.collection.get_default()
+        authinfo = orm.AuthInfo(computer=computer, user=user)
+        auth_params = _build_transport_auth_params(payload, transport_type, auth_fields)
+        authinfo.set_auth_params(auth_params)
+        authinfo.store()
+
+        try:
+            with computer.get_transport() as transport:
+                if not transport.is_open:
+                    transport.open()
+            return {
+                "status": "success",
+                "connection_status": "success",
+                "connection_error": None,
+            }
+        except Exception as conn_exc:
+            return {
+                "status": "error",
+                "connection_status": "failed",
+                "connection_error": str(conn_exc),
+            }
+    except Exception as exc:
+        raise http_error(500, "Failed to test infrastructure connection", reason=str(exc))
+    finally:
+        if temporary_pk is not None:
+            with suppress(Exception):
+                orm.Computer.collection.delete(temporary_pk)

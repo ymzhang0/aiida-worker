@@ -13,7 +13,7 @@ from typing import Any, Mapping
 
 from fastapi import APIRouter, HTTPException
 
-from aiida import load_profile, orm
+from aiida import __version__ as AIIDA_CORE_VERSION, load_profile, orm
 from aiida.manage.configuration import get_config
 from aiida.manage.manager import get_manager
 from aiida.storage.sqlite_zip.backend import SqliteZipBackend
@@ -671,6 +671,7 @@ def get_system_info_payload() -> dict[str, Any]:
             "workchains": counts["workchains"],
         },
         "daemon_status": _is_daemon_running(),
+        "aiida_core_version": str(AIIDA_CORE_VERSION),
     }
 def serialize_computers() -> list[dict[str, Any]]:
     """Serialize all computers for API responses."""

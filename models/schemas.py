@@ -82,6 +82,7 @@ class SystemInfoResponse(BaseModel):
     profile: str
     counts: SystemCountsResponse
     daemon_status: bool
+    aiida_core_version: str | None = None
 
 
 class ComputerResource(BaseModel):
@@ -264,6 +265,10 @@ class InfrastructureSetupRequest(BaseModel):
     safe_interval: float | None = None
     use_login_shell: bool = True
     connection_timeout: int | None = None
+    host: str | None = None
+    max_io_allowed: int | None = None
+    authentication_script: str | None = None
+    backend: str | None = None
     
     # Code fields
     code_label: str | None = None
@@ -281,6 +286,14 @@ class SSHHostDetails(BaseModel):
     proxy_jump: str | None = None
     proxy_command: str | None = None
     identity_file: str | None = None
+
+
+class InfrastructureCapabilitiesResponse(BaseModel):
+    aiida_core_version: str
+    available_transports: list[str] = Field(default_factory=list)
+    recommended_transport: str = "core.ssh"
+    supports_async_ssh: bool = False
+    transport_auth_fields: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class UserInfoResponse(BaseModel):
